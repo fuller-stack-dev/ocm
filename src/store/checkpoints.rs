@@ -64,8 +64,10 @@ impl CheckpointCleanup {
     }
 
     pub(crate) fn retire(&self, path: &Path) -> Result<(), String> {
-        if !path_exists(path) {
-            return Ok(());
+        match fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.to_string()),
         }
         let id = self.0.next_retired.fetch_add(1, Ordering::Relaxed);
         fs::rename(path, self.0.root.join(format!("retired-{id}"))).map_err(|error| {
@@ -616,6 +618,27 @@ fn preserve_special_mode(destination: &Path, source_metadata: &fs::Metadata) -> 
 fn preserve_special_modes(source: &Path, destination: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
     if metadata.file_type().is_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // copyfile recreates symlinks with default permissions. chmod would
+        // follow the link and mutate its target, so restore the link mode itself.
+        let path = std::ffi::CString::new(destination.as_os_str().as_bytes())
+            .map_err(|error| error.to_string())?;
+        let result = unsafe {
+            libc::fchmodat(
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                (metadata.permissions().mode() & 0o7777) as libc::mode_t,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            return Err(format!(
+                "failed to preserve checkpoint symlink mode for {}: {}",
+                display_path(destination),
+                std::io::Error::last_os_error()
+            ));
+        }
         return Ok(());
     }
     if metadata.is_file() {
@@ -632,8 +655,9 @@ fn preserve_special_modes(source: &Path, destination: &Path) -> Result<(), Strin
 
 #[cfg(target_os = "macos")]
 fn verify_changed_checkpoint_path(source: &Path, destination: &Path) -> Result<(), String> {
-    let source_exists = path_exists(source);
-    let destination_exists = path_exists(destination);
+    // A dangling symlink is still a captured entry, not an absent path.
+    let source_exists = fs::symlink_metadata(source).is_ok();
+    let destination_exists = fs::symlink_metadata(destination).is_ok();
     if !source_exists && !destination_exists {
         return Ok(());
     }
@@ -1282,5 +1306,51 @@ mod tests {
             0o4755
         );
         verify_tree_checkpoint(source.path(), &destination).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn changed_symlink_preserves_restricted_permissions_without_touching_its_target() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("target"), "unchanged target").unwrap();
+        symlink("missing", source.path().join("link")).unwrap();
+        let prepared = prepare_tree_checkpoint(source.path()).unwrap();
+        fs::remove_file(source.path().join("link")).unwrap();
+        symlink("target", source.path().join("link")).unwrap();
+        let link =
+            std::ffi::CString::new(source.path().join("link").as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe {
+                libc::fchmodat(
+                    libc::AT_FDCWD,
+                    link.as_ptr(),
+                    0o750,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            },
+            0
+        );
+        let target_mode = fs::metadata(source.path().join("target")).unwrap().mode();
+        let destination_parent = tempfile::tempdir().unwrap();
+        let destination = destination_parent.path().join("checkpoint");
+        create_tree_checkpoint_from_preparation(prepared, &destination).unwrap();
+        verify_tree_checkpoint(source.path(), &destination).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(destination.join("link"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o750
+        );
+        assert_eq!(
+            fs::metadata(destination.join("target")).unwrap().mode(),
+            target_mode
+        );
+        assert_eq!(
+            fs::metadata(source.path().join("target")).unwrap().mode(),
+            target_mode
+        );
     }
 }
