@@ -5,6 +5,10 @@ use std::io::Read;
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 #[cfg(not(target_os = "macos"))]
 use filetime::{FileTime, set_file_times, set_symlink_file_times};
@@ -23,8 +27,74 @@ pub(crate) const STORAGE_TAR_ARCHIVE: &str = "tar-archive-v1";
 #[derive(Debug)]
 pub(crate) struct PreparedTreeCheckpoint {
     source: PathBuf,
+    cleanup: CheckpointCleanup,
     #[cfg(target_os = "macos")]
-    regular_files: HashMap<Box<[u8]>, PreparedRegularFile>,
+    cloned: bool,
+    #[cfg(target_os = "macos")]
+    entries: HashMap<Box<[u8]>, PreparedEntry>,
+}
+
+/// Service owners retain this guard until restart/rollback has finished. Neither a
+/// failed capture nor replacing a large staged directory may delete it while offline.
+#[derive(Clone, Debug)]
+pub(crate) struct CheckpointCleanup(Arc<CheckpointWorkspace>);
+
+#[derive(Debug)]
+struct CheckpointWorkspace {
+    root: PathBuf,
+    next_retired: AtomicU64,
+}
+
+impl CheckpointCleanup {
+    fn new(parent: &Path) -> Result<Self, String> {
+        ensure_dir(parent)?;
+        let root = tempfile::Builder::new()
+            .prefix(".checkpoint-preparation-")
+            .tempdir_in(parent)
+            .map_err(|error| error.to_string())?
+            .keep();
+        Ok(Self(Arc::new(CheckpointWorkspace {
+            root,
+            next_retired: AtomicU64::new(0),
+        })))
+    }
+
+    fn candidate(&self) -> PathBuf {
+        self.0.root.join("tree")
+    }
+
+    pub(crate) fn retire(&self, path: &Path) -> Result<(), String> {
+        if !path_exists(path) {
+            return Ok(());
+        }
+        let id = self.0.next_retired.fetch_add(1, Ordering::Relaxed);
+        fs::rename(path, self.0.root.join(format!("retired-{id}"))).map_err(|error| {
+            format!(
+                "failed to defer checkpoint cleanup; retained {}: {error}",
+                display_path(path)
+            )
+        })
+    }
+}
+
+impl Drop for CheckpointWorkspace {
+    fn drop(&mut self) {
+        if let Err(error) = remove_tree_if_present(&self.root) {
+            eprintln!(
+                "ocm: retained checkpoint preparation {}: {error}",
+                display_path(&self.root)
+            );
+        } else if let Some(parent) = self.root.parent() {
+            // Remove only an empty parent; never recursively clean a shared snapshot directory.
+            let _ = fs::remove_dir(parent);
+        }
+    }
+}
+
+impl PreparedTreeCheckpoint {
+    pub(crate) fn cleanup_guard(&self) -> CheckpointCleanup {
+        self.cleanup.clone()
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -42,7 +112,7 @@ struct FileFingerprint {
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug)]
-struct PreparedRegularFile {
+struct PreparedEntry {
     fingerprint: Option<FileFingerprint>,
     sqlite: bool,
 }
@@ -59,11 +129,23 @@ pub(crate) fn default_snapshot_storage_kind() -> String {
 }
 
 pub(crate) fn create_tree_checkpoint(source: &Path, destination: &Path) -> Result<String, String> {
-    let prepared = prepare_tree_checkpoint(source)?;
+    let parent = destination
+        .parent()
+        .ok_or("checkpoint destination has no parent")?;
+    let prepared = prepare_tree_checkpoint_in(source, parent)?;
     create_tree_checkpoint_from_preparation(prepared, destination)
 }
 
-pub(crate) fn prepare_tree_checkpoint(source: &Path) -> Result<PreparedTreeCheckpoint, String> {
+#[cfg(test)]
+fn prepare_tree_checkpoint(source: &Path) -> Result<PreparedTreeCheckpoint, String> {
+    let parent = source.parent().ok_or("checkpoint source has no parent")?;
+    prepare_tree_checkpoint_in(source, parent)
+}
+
+pub(crate) fn prepare_tree_checkpoint_in(
+    source: &Path,
+    parent: &Path,
+) -> Result<PreparedTreeCheckpoint, String> {
     if !path_exists(source) {
         return Err(format!(
             "checkpoint source does not exist: {}",
@@ -72,14 +154,29 @@ pub(crate) fn prepare_tree_checkpoint(source: &Path) -> Result<PreparedTreeCheck
     }
 
     #[cfg(target_os = "macos")]
-    let regular_files = prepare_regular_files(source)?;
+    let entries = prepare_entries(source)?;
     #[cfg(not(target_os = "macos"))]
     preflight_sqlite_databases(source)?;
 
+    let cleanup = CheckpointCleanup::new(parent)?;
+    #[cfg(target_os = "macos")]
+    let cloned = {
+        // This live copy is only a seed. Fingerprints were recorded BEFORE cloning;
+        // capture must reconcile everything that changed before publishing it.
+        let cloned = clone_tree_checkpoint(source, &cleanup.candidate()).is_ok();
+        if !cloned {
+            cleanup.retire(&cleanup.candidate())?;
+        }
+        cloned
+    };
+
     Ok(PreparedTreeCheckpoint {
         source: source.to_path_buf(),
+        cleanup,
         #[cfg(target_os = "macos")]
-        regular_files,
+        cloned,
+        #[cfg(target_os = "macos")]
+        entries,
     })
 }
 
@@ -97,41 +194,29 @@ pub(crate) fn create_tree_checkpoint_from_preparation(
         ensure_dir(parent)?;
     }
 
+    let candidate = prepared.cleanup.candidate();
     #[cfg(target_os = "macos")]
-    {
-        match clone_tree_checkpoint(&prepared.source, destination) {
-            Ok(()) => {
-                if let Err(error) = (|| {
-                    verify_prepared_clone(&prepared.source, destination, prepared.regular_files)?;
-                    sync_tree_root(destination)
-                })() {
-                    let _ = remove_tree_if_present(destination);
-                    return Err(error);
-                }
-                return Ok(STORAGE_APFS_CLONE.to_string());
-            }
-            Err(clone_error) => {
-                remove_tree_if_present(destination)?;
-                copyfile_tree(&prepared.source, destination).map_err(|copy_error| {
-                    format!(
-                        "APFS clone was unavailable ({clone_error}); full checkpoint copy also failed: {copy_error}"
-                    )
-                })?;
-            }
-        }
+    if prepared.cloned {
+        capture_prepared_clone(
+            &prepared.source,
+            &candidate,
+            prepared.entries,
+            &prepared.cleanup,
+        )?;
+        sync_tree_root(&candidate)?;
+        fs::rename(&candidate, destination).map_err(|error| error.to_string())?;
+        return Ok(STORAGE_APFS_CLONE.to_string());
+    } else {
+        copyfile_tree(&prepared.source, &candidate)?;
     }
 
     #[cfg(not(target_os = "macos"))]
-    copy_tree_preserving_metadata(&prepared.source, destination)?;
+    copy_tree_preserving_metadata(&prepared.source, &candidate)?;
 
-    if let Err(error) = (|| {
-        verify_tree_checkpoint(&prepared.source, destination)?;
-        verify_sqlite_databases(destination)?;
-        sync_tree_root(destination)
-    })() {
-        let _ = remove_tree_if_present(destination);
-        return Err(error);
-    }
+    verify_tree_checkpoint(&prepared.source, &candidate)?;
+    verify_sqlite_databases(&candidate)?;
+    sync_tree_root(&candidate)?;
+    fs::rename(&candidate, destination).map_err(|error| error.to_string())?;
     Ok(STORAGE_FULL_COPY.to_string())
 }
 
@@ -226,17 +311,17 @@ fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn prepare_regular_files(root: &Path) -> Result<HashMap<Box<[u8]>, PreparedRegularFile>, String> {
+fn prepare_entries(root: &Path) -> Result<HashMap<Box<[u8]>, PreparedEntry>, String> {
     let mut out = HashMap::new();
-    prepare_regular_path(root, root, &mut out)?;
+    prepare_entry_path(root, root, &mut out)?;
     Ok(out)
 }
 
 #[cfg(target_os = "macos")]
-fn prepare_regular_path(
+fn prepare_entry_path(
     root: &Path,
     path: &Path,
-    out: &mut HashMap<Box<[u8]>, PreparedRegularFile>,
+    out: &mut HashMap<Box<[u8]>, PreparedEntry>,
 ) -> Result<(), String> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -250,6 +335,14 @@ fn prepare_regular_path(
     };
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
+        let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
+        out.insert(
+            relative.as_os_str().as_bytes().to_vec().into_boxed_slice(),
+            PreparedEntry {
+                fingerprint: Some(file_fingerprint(&metadata)),
+                sqlite: false,
+            },
+        );
         return Ok(());
     }
     if file_type.is_file() {
@@ -266,7 +359,7 @@ fn prepare_regular_path(
             Err(_) if !path_exists(path) => {
                 out.insert(
                     relative,
-                    PreparedRegularFile {
+                    PreparedEntry {
                         fingerprint: None,
                         sqlite: false,
                     },
@@ -283,7 +376,7 @@ fn prepare_regular_path(
         };
         out.insert(
             relative,
-            PreparedRegularFile {
+            PreparedEntry {
                 fingerprint: after.filter(|fingerprint| {
                     *fingerprint == before && sqlite_check != SqliteCheck::Deferred
                 }),
@@ -293,6 +386,14 @@ fn prepare_regular_path(
         return Ok(());
     }
     if file_type.is_dir() {
+        let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
+        out.insert(
+            relative.as_os_str().as_bytes().to_vec().into_boxed_slice(),
+            PreparedEntry {
+                fingerprint: Some(file_fingerprint(&metadata)),
+                sqlite: false,
+            },
+        );
         let entries = match fs::read_dir(path) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -300,7 +401,7 @@ fn prepare_regular_path(
         };
         for entry in entries {
             match entry {
-                Ok(entry) => prepare_regular_path(root, &entry.path(), out)?,
+                Ok(entry) => prepare_entry_path(root, &entry.path(), out)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.to_string()),
             }
@@ -326,17 +427,26 @@ fn file_fingerprint(metadata: &fs::Metadata) -> FileFingerprint {
 }
 
 #[cfg(target_os = "macos")]
-fn verify_prepared_clone(
+fn capture_prepared_clone(
     source: &Path,
     destination: &Path,
-    mut prepared: HashMap<Box<[u8]>, PreparedRegularFile>,
+    mut prepared: HashMap<Box<[u8]>, PreparedEntry>,
+    cleanup: &CheckpointCleanup,
 ) -> Result<(), String> {
     let mut candidates = HashSet::new();
-    verify_prepared_path(source, source, destination, &mut prepared, &mut candidates)?;
+    capture_prepared_path(
+        source,
+        source,
+        destination,
+        &mut prepared,
+        &mut candidates,
+        cleanup,
+    )?;
     for (relative, prior) in prepared {
         let relative = PathBuf::from(std::ffi::OsStr::from_bytes(&relative).to_os_string());
-        verify_changed_checkpoint_path(&source.join(&relative), &destination.join(&relative))?;
-        if prior.sqlite && path_exists(&destination.join(&relative)) {
+        // Remaining entries were deleted or changed type. Reconciliation already
+        // removed them; do not traverse an old path through a replacement symlink.
+        if prior.sqlite && checkpoint_regular_file(destination, &relative)? {
             candidates.insert(destination.join(&relative));
         }
         if let Some(primary) = sqlite_primary_for_sidecar(&relative) {
@@ -347,12 +457,11 @@ fn verify_prepared_clone(
     let mut candidates = candidates.into_iter().collect::<Vec<_>>();
     candidates.sort();
     for path in candidates {
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.to_string()),
-        };
-        if metadata.is_file() {
+        if checkpoint_regular_file(
+            destination,
+            path.strip_prefix(destination)
+                .map_err(|error| error.to_string())?,
+        )? {
             let _ = verify_sqlite_database(&path)?;
         }
     }
@@ -360,50 +469,125 @@ fn verify_prepared_clone(
 }
 
 #[cfg(target_os = "macos")]
-fn verify_prepared_path(
+fn checkpoint_regular_file(root: &Path, relative: &Path) -> Result<bool, String> {
+    if relative.as_os_str().is_empty() {
+        return fs::symlink_metadata(root)
+            .map(|metadata| metadata.is_file())
+            .map_err(|error| error.to_string());
+    }
+    let mut path = root.to_path_buf();
+    for component in relative.components() {
+        path.push(component);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(false),
+            Ok(metadata) if path == root.join(relative) => return Ok(metadata.is_file()),
+            Ok(metadata) if !metadata.is_dir() => return Ok(false),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn capture_prepared_path(
     root: &Path,
     path: &Path,
     destination: &Path,
-    prepared: &mut HashMap<Box<[u8]>, PreparedRegularFile>,
+    prepared: &mut HashMap<Box<[u8]>, PreparedEntry>,
     sqlite_candidates: &mut HashSet<PathBuf>,
-) -> Result<(), String> {
+    cleanup: &CheckpointCleanup,
+) -> Result<bool, String> {
+    use std::os::unix::fs::PermissionsExt;
+
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
+    let destination_path = destination.join(relative);
+    let prior = prepared.remove(relative.as_os_str().as_bytes());
+    let unchanged = prior
+        .and_then(|entry| entry.fingerprint)
+        .is_some_and(|fingerprint| fingerprint == file_fingerprint(&metadata));
     if metadata.file_type().is_symlink() {
-        return Ok(());
+        if unchanged {
+            return Ok(false);
+        }
+        cleanup.retire(&destination_path)?;
+        copyfile_tree(path, &destination_path)?;
+        verify_changed_checkpoint_path(path, &destination_path)?;
+        return Ok(true);
     }
     if metadata.is_file() {
-        let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
-        let relative_bytes = relative.as_os_str().as_bytes();
-        let current = file_fingerprint(&metadata);
-        let prior = prepared.remove(relative_bytes);
-        let unchanged = prior
-            .and_then(|entry| entry.fingerprint)
-            .is_some_and(|fingerprint| fingerprint == current);
-        let destination_path = destination.join(relative);
-        preserve_special_mode(&destination_path, &metadata)?;
         if !unchanged {
+            // An unchanged source fingerprint spans the live clone. All other
+            // files need a fresh capture; never overwrite a staged link or tree.
+            cleanup.retire(&destination_path)?;
+            if clone_tree_checkpoint(path, &destination_path).is_err() {
+                cleanup.retire(&destination_path)?;
+                copyfile_tree(path, &destination_path)?;
+            }
+            preserve_special_mode(&destination_path, &metadata)?;
             verify_changed_checkpoint_path(path, &destination_path)?;
             if prior.is_some_and(|entry| entry.sqlite) || has_sqlite_magic(path)? {
-                sqlite_candidates.insert(destination_path);
+                sqlite_candidates.insert(destination_path.clone());
             }
             if let Some(primary) = sqlite_primary_for_sidecar(relative) {
                 sqlite_candidates.insert(destination.join(primary));
             }
         }
-        return Ok(());
+        if unchanged {
+            preserve_special_mode(&destination_path, &metadata)?;
+        }
+        return Ok(!unchanged);
     }
     if metadata.is_dir() {
+        let destination_metadata = match fs::symlink_metadata(&destination_path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        let created = !destination_metadata.is_some_and(|metadata| metadata.is_dir());
+        if created {
+            cleanup.retire(&destination_path)?;
+            fs::create_dir(&destination_path).map_err(|error| error.to_string())?;
+        }
+        // Cloned directories can be read-only. Restore full metadata after children.
+        let made_writable = metadata.permissions().mode() & 0o700 != 0o700;
+        if made_writable || !unchanged {
+            fs::set_permissions(&destination_path, fs::Permissions::from_mode(0o700))
+                .map_err(|error| error.to_string())?;
+        }
+        let mut names = HashSet::new();
+        let mut children_changed = false;
         for entry in fs::read_dir(path).map_err(|error| error.to_string())? {
-            verify_prepared_path(
+            let entry = entry.map_err(|error| error.to_string())?;
+            names.insert(entry.file_name());
+            children_changed |= capture_prepared_path(
                 root,
-                &entry.map_err(|error| error.to_string())?.path(),
+                &entry.path(),
                 destination,
                 prepared,
                 sqlite_candidates,
+                cleanup,
             )?;
         }
+        for entry in fs::read_dir(&destination_path).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            if !names.contains(&entry.file_name()) {
+                // Bounded rename, even for a removed dependency tree.
+                cleanup.retire(&entry.path())?;
+                children_changed = true;
+            }
+        }
+        if !unchanged || made_writable || children_changed {
+            copyfile_metadata(path, &destination_path)?;
+        }
+        return Ok(created);
     }
-    Ok(())
+    Err(format!(
+        "unsupported special file in checkpoint: {}",
+        display_path(path)
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -597,6 +781,7 @@ fn clone_tree_checkpoint(source: &Path, destination: &Path) -> Result<(), String
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
 
+    const CLONE_NOFOLLOW: u32 = 1;
     const CLONE_ACL: u32 = 1 << 2;
     let destination_parent = destination
         .parent()
@@ -615,7 +800,13 @@ fn clone_tree_checkpoint(source: &Path, destination: &Path) -> Result<(), String
     let destination_c =
         CString::new(destination.as_os_str().as_bytes()).map_err(|error| error.to_string())?;
     // Directory clonefile is all-or-nothing and never falls back to byte copying.
-    let result = unsafe { clonefile(source_c.as_ptr(), destination_c.as_ptr(), CLONE_ACL) };
+    let result = unsafe {
+        clonefile(
+            source_c.as_ptr(),
+            destination_c.as_ptr(),
+            CLONE_ACL | CLONE_NOFOLLOW,
+        )
+    };
     if result != 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
@@ -624,12 +815,25 @@ fn clone_tree_checkpoint(source: &Path, destination: &Path) -> Result<(), String
 
 #[cfg(target_os = "macos")]
 fn copyfile_tree(source: &Path, destination: &Path) -> Result<(), String> {
+    const COPYFILE_ALL: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
+    const COPYFILE_RECURSIVE: u32 = 1 << 15;
+    copyfile_with_flags(source, destination, COPYFILE_ALL | COPYFILE_RECURSIVE)?;
+    preserve_special_modes(source, destination)
+}
+
+#[cfg(target_os = "macos")]
+fn copyfile_metadata(source: &Path, destination: &Path) -> Result<(), String> {
+    const COPYFILE_METADATA: u32 = (1 << 0) | (1 << 1) | (1 << 2);
+    copyfile_with_flags(source, destination, COPYFILE_METADATA)
+}
+
+#[cfg(target_os = "macos")]
+fn copyfile_with_flags(source: &Path, destination: &Path, flags: u32) -> Result<(), String> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    const COPYFILE_ALL: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
-    const COPYFILE_RECURSIVE: u32 = 1 << 15;
     const COPYFILE_NOFOLLOW_SRC: u32 = 1 << 18;
+    const COPYFILE_NOFOLLOW_DST: u32 = 1 << 19;
     const COPYFILE_STATE_PRESERVE_SUID: u32 = 16;
 
     let source_c =
@@ -659,7 +863,7 @@ fn copyfile_tree(source: &Path, destination: &Path) -> Result<(), String> {
             source_c.as_ptr(),
             destination_c.as_ptr(),
             state,
-            COPYFILE_ALL | COPYFILE_RECURSIVE | COPYFILE_NOFOLLOW_SRC,
+            flags | COPYFILE_NOFOLLOW_SRC | COPYFILE_NOFOLLOW_DST,
         )
     };
     unsafe {
@@ -668,7 +872,6 @@ fn copyfile_tree(source: &Path, destination: &Path) -> Result<(), String> {
     if result != 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
-    preserve_special_modes(source, destination)?;
     Ok(())
 }
 
@@ -868,6 +1071,157 @@ mod tests {
 
         assert_eq!(storage, STORAGE_APFS_CLONE);
         verify_tree_checkpoint(source.path(), &destination).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepared_checkpoint_reconciles_live_changes_without_recopying_unchanged_files() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+        let source = tempfile::tempdir().unwrap();
+        let destination_parent = tempfile::tempdir().unwrap();
+        let destination = destination_parent.path().join("checkpoint");
+        fs::write(source.path().join("unchanged"), "bulk data").unwrap();
+        fs::write(source.path().join("changed"), "before").unwrap();
+        fs::write(source.path().join("file-to-dir"), "old").unwrap();
+        fs::create_dir_all(source.path().join("removed/node_modules/pkg")).unwrap();
+        fs::write(
+            source.path().join("removed/node_modules/pkg/data"),
+            "dependency",
+        )
+        .unwrap();
+        fs::create_dir(source.path().join("dir-to-link")).unwrap();
+        fs::write(source.path().join("dir-to-link/state.sqlite-wal"), "old").unwrap();
+        symlink("unchanged", source.path().join("link")).unwrap();
+        symlink("unchanged", source.path().join("unchanged-link")).unwrap();
+        xattr::set(source.path(), "user.ocm-removed", b"old").unwrap();
+
+        let prepared = prepare_tree_checkpoint(source.path()).unwrap();
+        assert!(prepared.cloned);
+        let cleanup = prepared.cleanup_guard();
+        let unchanged_inode = fs::metadata(cleanup.candidate().join("unchanged"))
+            .unwrap()
+            .ino();
+        let unchanged_link_inode = fs::symlink_metadata(cleanup.candidate().join("unchanged-link"))
+            .unwrap()
+            .ino();
+        let modified = filetime::FileTime::from_last_modification_time(
+            &fs::metadata(source.path().join("changed")).unwrap(),
+        );
+        fs::write(source.path().join("changed"), "after!").unwrap();
+        filetime::set_file_mtime(source.path().join("changed"), modified).unwrap();
+        fs::remove_dir_all(source.path().join("removed")).unwrap();
+        fs::remove_file(source.path().join("file-to-dir")).unwrap();
+        fs::create_dir(source.path().join("file-to-dir")).unwrap();
+        fs::write(source.path().join("file-to-dir/new"), "new").unwrap();
+        fs::remove_dir_all(source.path().join("dir-to-link")).unwrap();
+        symlink(destination_parent.path(), source.path().join("dir-to-link")).unwrap();
+        fs::remove_file(source.path().join("link")).unwrap();
+        symlink("missing", source.path().join("link")).unwrap();
+        xattr::remove(source.path(), "user.ocm-removed").unwrap();
+        xattr::set(source.path(), "user.ocm-added", b"new").unwrap();
+        fs::set_permissions(source.path(), fs::Permissions::from_mode(0o750)).unwrap();
+
+        create_tree_checkpoint_from_preparation(prepared, &destination).unwrap();
+
+        verify_tree_checkpoint(source.path(), &destination).unwrap();
+        assert_eq!(
+            fs::metadata(destination.join("unchanged")).unwrap().ino(),
+            unchanged_inode
+        );
+        assert_eq!(
+            fs::symlink_metadata(destination.join("unchanged-link"))
+                .unwrap()
+                .ino(),
+            unchanged_link_inode
+        );
+        assert_eq!(xattr::get(&destination, "user.ocm-removed").unwrap(), None);
+        assert_eq!(
+            xattr::get(&destination, "user.ocm-added").unwrap(),
+            Some(b"new".to_vec())
+        );
+        let retired = fs::read_dir(&cleanup.0.root).unwrap().count();
+        assert!(
+            retired >= 4,
+            "displaced trees must survive until the service owner releases cleanup"
+        );
+        let cleanup_root = cleanup.0.root.clone();
+        drop(cleanup);
+        assert!(!cleanup_root.exists());
+        assert!(destination.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn failed_capture_defers_tree_cleanup_until_service_owner_releases_guard() {
+        for force_full_copy in [false, true] {
+            let source = tempfile::tempdir().unwrap();
+            fs::write(source.path().join("bulk"), "unchanged").unwrap();
+            let mut prepared = prepare_tree_checkpoint(source.path()).unwrap();
+            let cleanup = prepared.cleanup_guard();
+            if force_full_copy {
+                cleanup.retire(&cleanup.candidate()).unwrap();
+                prepared.cloned = false;
+            }
+            fs::write(
+                source.path().join("late.sqlite"),
+                b"SQLite format 3\0not a database",
+            )
+            .unwrap();
+            let destination_parent = tempfile::tempdir().unwrap();
+            let destination = destination_parent.path().join("checkpoint");
+
+            let error =
+                create_tree_checkpoint_from_preparation(prepared, &destination).unwrap_err();
+
+            assert!(error.contains("SQLite"), "{error}");
+            assert!(!destination.exists());
+            assert!(cleanup.candidate().join("bulk").exists());
+            let cleanup_root = cleanup.0.root.clone();
+            drop(cleanup);
+            assert!(!cleanup_root.exists());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepared_checkpoint_reconciles_wal_commits_and_sidecar_removal() {
+        let source = tempfile::tempdir().unwrap();
+        let database_path = source.path().join("state.sqlite");
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE state(value TEXT); INSERT INTO state VALUES ('before');").unwrap();
+        let prepared = prepare_tree_checkpoint(source.path()).unwrap();
+        database
+            .execute_batch("INSERT INTO state VALUES ('after');")
+            .unwrap();
+        let destination_parent = tempfile::tempdir().unwrap();
+        let destination = destination_parent.path().join("checkpoint");
+        create_tree_checkpoint_from_preparation(prepared, &destination).unwrap();
+        let captured = rusqlite::Connection::open(destination.join("state.sqlite")).unwrap();
+        let count: i64 = captured
+            .query_row("SELECT count(*) FROM state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        drop(captured);
+
+        let prepared = prepare_tree_checkpoint(source.path()).unwrap();
+        drop(database);
+        assert!(!source.path().join("state.sqlite-wal").exists());
+        let destination = destination_parent
+            .path()
+            .join("checkpoint-without-sidecars");
+        create_tree_checkpoint_from_preparation(prepared, &destination).unwrap();
+        // SQLite's read-only verification may create fresh empty WAL/SHM files;
+        // it must not replay the stale sidecars from the live preparation.
+        assert_eq!(
+            fs::read(&database_path).unwrap(),
+            fs::read(destination.join("state.sqlite")).unwrap()
+        );
+        let captured = rusqlite::Connection::open(destination.join("state.sqlite")).unwrap();
+        let count: i64 = captured
+            .query_row("SELECT count(*) FROM state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[cfg(target_os = "macos")]

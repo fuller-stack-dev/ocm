@@ -957,6 +957,7 @@ impl Cli {
         let prepared = self
             .environment_service()
             .prepare_snapshot_capture_locked(env_name)?;
+        let _checkpoint_cleanup = prepared.cleanup_guard();
         let service_state = self
             .service_service()
             .quiesce_for_snapshot_locked(env_name)?;
@@ -4305,6 +4306,7 @@ impl Cli {
             .environment_service()
             .prepare_snapshot_capture_locked(env_name)?;
         let mut seen = BTreeSet::new();
+        let checkpoint_cleanup = prepared.cleanup_guard();
         let mut runtime_backups: Vec<RuntimeRollbackBackup> = Vec::new();
         let mut created_runtime_names = Vec::new();
 
@@ -4387,16 +4389,16 @@ impl Cli {
         let snapshot = match snapshot_result {
             Ok(snapshot) => snapshot,
             Err(error) => {
+                let restore_result = self
+                    .service_service()
+                    .restore_after_snapshot_locked(env_name, service_state);
                 for backup in runtime_backups {
                     backup.cleanup();
                 }
                 let snapshot_error = format!(
                     "failed to create {snapshot_label} snapshot for env \"{env_name}\": {error}"
                 );
-                return match self
-                    .service_service()
-                    .restore_after_snapshot_locked(env_name, service_state)
-                {
+                return match restore_result {
                     Ok(()) => Err(snapshot_error),
                     Err(service_error) => Err(format!(
                         "{snapshot_error}; also failed to restore the managed service after snapshot capture: {service_error}"
@@ -4416,6 +4418,7 @@ impl Cli {
 
         Ok(UpgradeTransaction {
             id,
+            _checkpoint_cleanup: checkpoint_cleanup,
             snapshot_id: snapshot.id,
             runtime_backups,
             created_runtime_names,
@@ -5065,6 +5068,8 @@ impl UpgradeSimulationScenario {
 #[derive(Debug)]
 struct UpgradeTransaction {
     id: String,
+    // Retain failed/displaced preparation trees through restart or rollback.
+    _checkpoint_cleanup: crate::store::CheckpointCleanup,
     snapshot_id: String,
     runtime_backups: Vec<RuntimeRollbackBackup>,
     created_runtime_names: Vec<String>,

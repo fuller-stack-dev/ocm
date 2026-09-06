@@ -811,6 +811,7 @@ impl Cli {
             let prepared = self
                 .environment_service()
                 .prepare_snapshot_capture_locked(name)?;
+            let _checkpoint_cleanup = prepared.cleanup_guard();
             let service_state = self
                 .service_service()
                 .quiesce_for_snapshot_locked(name)?;

@@ -18,6 +18,7 @@ use time::OffsetDateTime;
 
 use crate::env::EnvMeta;
 use crate::env::EnvSummary;
+pub(crate) use checkpoints::CheckpointCleanup;
 pub(crate) use common::{
     ExclusiveFileLock, copy_dir_recursive, ensure_dir, lock_file, read_json, write_json,
 };

@@ -1741,6 +1741,9 @@ fn env_snapshot_rechecks_sqlite_mutated_after_preflight_and_restores_service() {
     let ocm_home = env.get("OCM_HOME").unwrap().clone();
     let observer_done = Arc::new(AtomicBool::new(false));
     let observer_mutated = Arc::new(AtomicBool::new(false));
+    let cleanup_deferred = Arc::new(AtomicBool::new(false));
+    let cleanup_deferred_thread = Arc::clone(&cleanup_deferred);
+    let snapshot_dir = root.child("ocm-home/snapshots/source");
     let observer_done_thread = Arc::clone(&observer_done);
     let observer_mutated_thread = Arc::clone(&observer_mutated);
     let observer_database = database_path.clone();
@@ -1757,6 +1760,11 @@ fn env_snapshot_rechecks_sqlite_mutated_after_preflight_and_restores_service() {
                 .unwrap_or(last_running);
             if desired_running != last_running {
                 if desired_running {
+                    cleanup_deferred_thread.store(
+                        fs::read_dir(&snapshot_dir)
+                            .is_ok_and(|mut entries| entries.next().is_some()),
+                        Ordering::Relaxed,
+                    );
                     fs::write(&observer_runtime_path, &running_runtime).unwrap();
                 } else {
                     fs::write(
@@ -1778,6 +1786,10 @@ fn env_snapshot_rechecks_sqlite_mutated_after_preflight_and_restores_service() {
     observer.join().unwrap();
 
     assert!(observer_mutated.load(Ordering::Relaxed));
+    assert!(
+        cleanup_deferred.load(Ordering::Relaxed),
+        "failed backup must survive until service restoration, not be deleted during the outage"
+    );
     assert_eq!(snapshot.status.code(), Some(1));
     assert!(
         stderr(&snapshot).contains("SQLite"),

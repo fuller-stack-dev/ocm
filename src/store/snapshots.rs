@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use super::checkpoints::{
-    PreparedTreeCheckpoint, STORAGE_TAR_ARCHIVE, copy_tree_checkpoint,
+    CheckpointCleanup, PreparedTreeCheckpoint, STORAGE_TAR_ARCHIVE, copy_tree_checkpoint,
     create_tree_checkpoint_from_preparation, default_snapshot_storage_kind,
-    prepare_tree_checkpoint, remove_tree_if_present,
+    prepare_tree_checkpoint_in, remove_tree_if_present,
 };
 use super::common::{
     copy_dir_recursive, copy_path_recursive, load_json_files, path_exists, read_json, write_json,
@@ -76,6 +76,12 @@ pub(crate) struct PreparedEnvSnapshotCapture {
     checkpoint: PreparedTreeCheckpoint,
 }
 
+impl PreparedEnvSnapshotCapture {
+    pub(crate) fn cleanup_guard(&self) -> CheckpointCleanup {
+        self.checkpoint.cleanup_guard()
+    }
+}
+
 #[derive(Debug)]
 struct RestoreOperationNamespace {
     root: PathBuf,
@@ -117,7 +123,8 @@ pub(crate) fn prepare_env_snapshot_capture(
             display_path(&env_paths.root)
         ));
     }
-    let checkpoint = prepare_tree_checkpoint(&env_paths.root)?;
+    let checkpoint =
+        prepare_tree_checkpoint_in(&env_paths.root, &snapshot_env_dir(&env_name, env, cwd)?)?;
     Ok(PreparedEnvSnapshotCapture {
         env_name,
         source_root: env_paths.root,
@@ -166,6 +173,7 @@ pub(crate) fn create_env_snapshot_from_preparation(
     let checkpoint_path = snapshot_checkpoint_path(&env_name, &snapshot_id, env, cwd)?;
     let meta_path = snapshot_meta_path(&env_name, &snapshot_id, env, cwd)?;
 
+    let cleanup = prepared.cleanup_guard();
     let result = (|| {
         let storage_kind =
             create_tree_checkpoint_from_preparation(prepared.checkpoint, &checkpoint_path)?;
@@ -190,12 +198,13 @@ pub(crate) fn create_env_snapshot_from_preparation(
         Ok(snapshot)
     })();
 
-    if result.is_err() {
-        let _ = remove_tree_if_present(&checkpoint_path);
+    if let Err(error) = result {
+        let cleanup_result = cleanup.retire(&checkpoint_path);
         let _ = fs::remove_file(&meta_path);
-        if let Some(snapshot_dir) = checkpoint_path.parent() {
-            let _ = fs::remove_dir(snapshot_dir);
-        }
+        return Err(match cleanup_result {
+            Ok(()) => error,
+            Err(cleanup_error) => format!("{error}; {cleanup_error}"),
+        });
     }
 
     result
