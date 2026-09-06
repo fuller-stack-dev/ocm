@@ -380,15 +380,27 @@ fn verify_prepared_path(
             .and_then(|entry| entry.fingerprint)
             .is_some_and(|fingerprint| fingerprint == current);
         let destination_path = destination.join(relative);
-        preserve_special_mode(&destination_path, &metadata)?;
         if !unchanged {
-            verify_changed_checkpoint_path(path, &destination_path)?;
+            if !is_service_output_log(relative)
+                || prior.is_some_and(|entry| entry.sqlite)
+                || !verify_captured_log_prefix(
+                    path,
+                    &destination_path,
+                    current,
+                    destination.parent().ok_or("checkpoint has no parent")?,
+                )?
+            {
+                preserve_special_mode(&destination_path, &metadata)?;
+                verify_changed_checkpoint_path(path, &destination_path)?;
+            }
             if prior.is_some_and(|entry| entry.sqlite) || has_sqlite_magic(path)? {
                 sqlite_candidates.insert(destination_path);
             }
             if let Some(primary) = sqlite_primary_for_sidecar(relative) {
                 sqlite_candidates.insert(destination.join(primary));
             }
+        } else {
+            preserve_special_mode(&destination_path, &metadata)?;
         }
         return Ok(());
     }
@@ -404,6 +416,116 @@ fn verify_prepared_path(
         }
     }
     Ok(())
+}
+
+// Only OpenClaw's standard service streams have a diagnostic prefix contract.
+// Other files under logs/, sessions, SQLite, and arbitrary *.log files remain exact.
+#[cfg(target_os = "macos")]
+fn is_service_output_log(relative: &Path) -> bool {
+    let parts = relative.iter().collect::<Vec<_>>();
+    parts.len() == 3
+        && parts[0].to_str().is_some_and(|name| {
+            name == ".openclaw"
+                || name
+                    .strip_prefix(".openclaw-")
+                    .is_some_and(|profile| !profile.is_empty())
+        })
+        && parts[1] == "logs"
+        && matches!(
+            parts[2].to_str(),
+            Some(
+                "node.log"
+                    | "node.err.log"
+                    | "node.error.log"
+                    | "gateway.log"
+                    | "gateway.err.log"
+                    | "gateway.error.log"
+            )
+        )
+}
+
+#[cfg(target_os = "macos")]
+fn verify_captured_log_prefix(
+    source: &Path,
+    destination: &Path,
+    observed: FileFingerprint,
+    scratch_parent: &Path,
+) -> Result<bool, String> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let captured_metadata = fs::symlink_metadata(destination).map_err(|e| e.to_string())?;
+    if !captured_metadata.is_file() || has_sqlite_magic(destination)? {
+        return Ok(false);
+    }
+    // Pin the source inode, not a pathname that rotation can replace. O_NOFOLLOW
+    // also prevents a replaced stream from turning this into a symlink exemption.
+    let live = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(source)
+        .map_err(|e| e.to_string())?;
+    let same_file = |metadata: &fs::Metadata| {
+        metadata.is_file()
+            && metadata.dev() == observed.device
+            && metadata.ino() == observed.inode
+            && metadata.mode() == observed.mode
+    };
+    if !same_file(&live.metadata().map_err(|e| e.to_string())?)
+        || captured_metadata.mode() != observed.mode
+    {
+        return Ok(false);
+    }
+    // Keep verification scratch outside the captured tree (including read-only
+    // log directories), so it can never become restored environment state.
+    let reference_dir = tempfile::tempdir_in(scratch_parent).map_err(|e| e.to_string())?;
+    let reference = reference_dir.path().join("stream");
+    let reference_c = CString::new(reference.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    // A second COW clone is a stable comparison source; never hash to the moving
+    // live EOF or retry until an independently managed writer becomes idle.
+    const CLONE_ACL: u32 = 1 << 2;
+    if unsafe {
+        fclonefileat(
+            live.as_raw_fd(),
+            libc::AT_FDCWD,
+            reference_c.as_ptr(),
+            CLONE_ACL,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "failed to clone checkpoint log reference: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if !same_file(&fs::symlink_metadata(source).map_err(|e| e.to_string())?)
+        || has_sqlite_magic(&reference)?
+    {
+        return Ok(false);
+    }
+    let mut reference_file = fs::File::open(&reference).map_err(|e| e.to_string())?;
+    if reference_file.metadata().map_err(|e| e.to_string())?.len() < captured_metadata.len() {
+        return Ok(false);
+    }
+    let mut captured = fs::File::open(destination).map_err(|e| e.to_string())?;
+    let mut remaining = captured_metadata.len();
+    let mut captured_buffer = [0_u8; 64 * 1024];
+    let mut reference_buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let count = remaining.min(captured_buffer.len() as u64) as usize;
+        captured
+            .read_exact(&mut captured_buffer[..count])
+            .map_err(|e| e.to_string())?;
+        reference_file
+            .read_exact(&mut reference_buffer[..count])
+            .map_err(|e| e.to_string())?;
+        if captured_buffer[..count] != reference_buffer[..count] {
+            return Ok(false);
+        }
+        remaining -= count as u64;
+    }
+    Ok(true)
 }
 
 #[cfg(target_os = "macos")]
@@ -583,6 +705,12 @@ unsafe extern "C" {
         state: CopyfileState,
         flag: u32,
         value: *const libc::c_void,
+    ) -> libc::c_int;
+    fn fclonefileat(
+        source_fd: libc::c_int,
+        destination_dir_fd: libc::c_int,
+        destination: *const libc::c_char,
+        flags: u32,
     ) -> libc::c_int;
     fn clonefile(
         source: *const libc::c_char,
@@ -810,6 +938,132 @@ mod tests {
                 .mode()
                 & 0o7777,
             0o4755
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apfs_checkpoint_accepts_captured_service_log_prefix() {
+        use std::io::Write;
+        for relative in [
+            ".openclaw/logs/node.log",
+            ".openclaw-rosita-node/logs/node.error.log",
+            ".openclaw/logs/gateway.log",
+            ".openclaw/logs/gateway.err.log",
+        ] {
+            let source = tempfile::tempdir().unwrap();
+            let log = source.path().join(relative);
+            fs::create_dir_all(log.parent().unwrap()).unwrap();
+            fs::write(&log, "captured diagnostics\n").unwrap();
+            fs::write(source.path().join("durable.json"), "durable state").unwrap();
+            let prepared = prepare_tree_checkpoint(source.path()).unwrap();
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("checkpoint");
+            super::clone_tree_checkpoint(source.path(), &destination).unwrap();
+            // The independent node can write after native capture, even while
+            // the environment's managed Gateway is quiescent.
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&log)
+                .unwrap()
+                .write_all(b"written after capture\n")
+                .unwrap();
+            super::verify_prepared_clone(source.path(), &destination, prepared.regular_files)
+                .unwrap();
+            assert_eq!(
+                fs::read(destination.join(relative)).unwrap(),
+                b"captured diagnostics\n"
+            );
+            assert_eq!(
+                fs::read(destination.join("durable.json")).unwrap(),
+                b"durable state"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apfs_checkpoint_refuses_non_log_appends_and_unsafe_log_changes() {
+        use std::io::Write;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        for (relative, change) in [
+            ("state.jsonl", "append"),
+            (".openclaw/logs/audit.jsonl", "append"),
+            ("workspace/.openclaw/logs/node.log", "append"),
+            (".openclaw/logs/node.log-wal", "append"),
+            (".openclaw/logs/node.log", "rewrite"),
+            (".openclaw/logs/node.log", "truncate"),
+            (".openclaw/logs/node.log", "rotate"),
+            (".openclaw/logs/node.log", "mode"),
+            (".openclaw/logs/node.log", "setuid"),
+            (".openclaw/logs/node.log", "setgid"),
+            (".openclaw/logs/node.log", "corrupt-capture"),
+            (".openclaw/logs/node.log", "symlink-capture"),
+        ] {
+            let source = tempfile::tempdir().unwrap();
+            let file = source.path().join(relative);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(&file, "captured diagnostics\n").unwrap();
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+            let prepared = prepare_tree_checkpoint(source.path()).unwrap();
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("checkpoint");
+            super::clone_tree_checkpoint(source.path(), &destination).unwrap();
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&file)
+                .unwrap()
+                .write_all(b"written after capture\n")
+                .unwrap();
+            match change {
+                "rewrite" => fs::write(&file, "rewritten diagnostics\nmore\n").unwrap(),
+                "truncate" => fs::write(&file, "short\n").unwrap(),
+                "rotate" => {
+                    fs::rename(&file, file.with_extension("log.1")).unwrap();
+                    fs::write(&file, "new generation diagnostics\n").unwrap();
+                }
+                "mode" => fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap(),
+                "setuid" => fs::set_permissions(&file, fs::Permissions::from_mode(0o4755)).unwrap(),
+                "setgid" => fs::set_permissions(&file, fs::Permissions::from_mode(0o2755)).unwrap(),
+                "corrupt-capture" => {
+                    fs::write(destination.join(relative), "corrupt diagnostics\n").unwrap()
+                }
+                "symlink-capture" => {
+                    fs::remove_file(destination.join(relative)).unwrap();
+                    symlink(&file, destination.join(relative)).unwrap();
+                }
+                _ => {}
+            }
+            let result =
+                super::verify_prepared_clone(source.path(), &destination, prepared.regular_files);
+            assert!(result.is_err(), "accepted {relative}: {change}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apfs_checkpoint_never_treats_sqlite_as_service_output() {
+        use std::io::Write;
+        let source = tempfile::tempdir().unwrap();
+        let database_path = source.path().join(".openclaw/logs/node.log");
+        fs::create_dir_all(database_path.parent().unwrap()).unwrap();
+        let db = rusqlite::Connection::open(&database_path).unwrap();
+        db.execute_batch("CREATE TABLE state(value); INSERT INTO state VALUES ('preserve');")
+            .unwrap();
+        drop(db);
+        let prepared = prepare_tree_checkpoint(source.path()).unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("checkpoint");
+        super::clone_tree_checkpoint(source.path(), &destination).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&database_path)
+            .unwrap()
+            .write_all(b"post-capture bytes")
+            .unwrap();
+        assert!(
+            super::verify_prepared_clone(source.path(), &destination, prepared.regular_files)
+                .is_err()
         );
     }
 

@@ -393,6 +393,11 @@ fn env_snapshot_restores_the_complete_durable_root_with_metadata_and_sqlite() {
     assert!(database_wal.exists());
     assert!(database_shm.exists());
     let expected_wal = fs::read(&database_wal).unwrap();
+    #[cfg(target_os = "macos")]
+    let log_relative = ".openclaw-rosita-node/logs/node.error.log";
+    #[cfg(target_os = "macos")]
+    let log_writer =
+        support::active_service_log::ActiveServiceLog::start(&env_root.join(log_relative));
 
     let snapshot = run_ocm(
         &cwd,
@@ -402,6 +407,16 @@ fn env_snapshot_restores_the_complete_durable_root_with_metadata_and_sqlite() {
     assert!(snapshot.status.success(), "{}", stderr(&snapshot));
     let snapshot_json: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
     let snapshot_id = snapshot_json["id"].as_str().unwrap();
+    #[cfg(target_os = "macos")]
+    let captured_log = {
+        let final_log = log_writer.finish();
+        let checkpoint = Path::new(snapshot_json["archivePath"].as_str().unwrap());
+        let captured = fs::read(checkpoint.join(log_relative)).unwrap();
+        assert!(!captured.is_empty());
+        assert!(final_log.starts_with(&captured));
+        fs::write(env_root.join(log_relative), b"changed after snapshot\n").unwrap();
+        captured
+    };
     drop(database);
 
     write_text(&dotenv, "OPENCLAW_SENTINEL=after\n");
@@ -460,6 +475,8 @@ fn env_snapshot_restores_the_complete_durable_root_with_metadata_and_sqlite() {
     );
     assert_eq!(fs::read_link(&future_link).unwrap(), Path::new("state.txt"));
     assert_eq!(fs::read(&database_wal).unwrap(), expected_wal);
+    #[cfg(target_os = "macos")]
+    assert_eq!(fs::read(env_root.join(log_relative)).unwrap(), captured_log);
     assert!(fs::metadata(&database_shm).unwrap().len() > 0);
 
     let restored = Connection::open_with_flags(

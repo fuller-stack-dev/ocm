@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+#[cfg(target_os = "macos")]
+pub mod active_service_log;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
