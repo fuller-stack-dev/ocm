@@ -572,9 +572,17 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
         finalize_timeline.mark("publication_released");
     });
 
+    #[cfg(target_os = "macos")]
+    let log_relative = ".openclaw-rosita-node/logs/node.error.log";
+    #[cfg(target_os = "macos")]
+    let log_writer = support::active_service_log::ActiveServiceLog::start(
+        &Path::new(env_json["root"].as_str().unwrap()).join(log_relative),
+    );
     timeline.mark("command_started");
     let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo"]);
     timeline.mark("command_finished");
+    #[cfg(target_os = "macos")]
+    let final_log = log_writer.finish();
 
     finalize_releaser.join().unwrap();
     delayed_server.join().unwrap();
@@ -644,6 +652,22 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
     let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
     assert!(history.status.success(), "{}", stderr(&history));
     let history_json: Value = serde_json::from_slice(&history.stdout).unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        let snapshot_id = history_json[0]["snapshotId"].as_str().unwrap();
+        let snapshot = run_ocm(
+            &cwd,
+            &env,
+            &["env", "snapshot", "show", "demo", snapshot_id, "--json"],
+        );
+        assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+        let snapshot_json: Value = serde_json::from_slice(&snapshot.stdout).unwrap();
+        let captured =
+            fs::read(Path::new(snapshot_json["archivePath"].as_str().unwrap()).join(log_relative))
+                .unwrap();
+        assert!(!captured.is_empty());
+        assert!(final_log.starts_with(&captured));
+    }
     let phases = history_json[0]["phases"]
         .as_array()
         .expect("upgrade receipt must include structured phase timings");

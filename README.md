@@ -38,6 +38,25 @@ Use `ocm` when you want:
 
 ## Install
 
+Install the npm distribution, available starting with OCM v0.2.40:
+
+```bash
+npm install --global @openclaw/ocm
+```
+
+See [npm installation and updates](npm/README.md) for Node requirements,
+project-local installs, npx, and daemon refresh behavior.
+
+Install with Homebrew on macOS (Apple Silicon or Intel) or Linux x86_64:
+
+```bash
+brew install openclaw/tap/ocm
+```
+
+Upgrade Homebrew installations with `brew upgrade openclaw/tap/ocm`, not
+`ocm self update`. Since v0.2.40, OCM refuses to overwrite a
+Homebrew-managed executable. `ocm self update --check` remains available.
+
 Install the latest release:
 
 ```bash
@@ -50,7 +69,7 @@ Install a specific release:
 curl -fsSL https://github.com/openclaw/ocm/releases/download/v<ocm-version>/install.sh | bash -s -- --version v<ocm-version>
 ```
 
-Update an existing install:
+Update an installer-managed install:
 
 ```bash
 ocm self update
@@ -149,7 +168,13 @@ New snapshots preserve the complete environment root, including credentials,
 browser profiles, plugin payloads, unknown future directories, modes, symlinks,
 and SQLite sidecars. OCM verifies tree contents and SQLite integrity before
 publishing the checkpoint. APFS uses copy-on-write clones when available;
-other filesystems use a metadata-preserving full copy. Restore discards only
+other filesystems use a metadata-preserving full copy. For standard OpenClaw
+node/gateway stdout and stderr logs under `.openclaw[-profile]/logs`, APFS
+verification accepts the captured bytes only when they exactly match a prefix
+of a stable clone of the same live file. Post-capture appends need not stop an
+independently managed node. Logs are retained, not excluded; rewrites, unsafe
+rotation, mode changes, SQLite (even at a log path), and all other state still
+require strict verification. Full-copy checkpoints remain exact. Restore discards only
 explicit process residue such as locks, sockets, PIDs, and temporary runtime
 directories. Legacy tar snapshots remain readable.
 
