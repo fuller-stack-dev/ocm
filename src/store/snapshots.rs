@@ -97,6 +97,42 @@ struct RestoreOperationNamespace {
     rejected_root: PathBuf,
 }
 
+/// Resolve existing aliases while retaining absent descendants. An unresolved
+/// symlink is ambiguous ownership, not evidence that a workspace is unrelated.
+fn resolve_scope_path(path: &Path) -> Result<PathBuf, String> {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        match fs::canonicalize(existing) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::symlink_metadata(existing) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => {
+                        return Err(format!(
+                            "cannot resolve workspace ownership: {}",
+                            display_path(path)
+                        ));
+                    }
+                }
+                missing.push(
+                    existing
+                        .file_name()
+                        .ok_or("missing workspace path name")?
+                        .to_os_string(),
+                );
+                existing = existing.parent().ok_or("missing workspace path parent")?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
 pub(crate) fn validate_upgrade_independent_paths(
     meta: &EnvMeta,
     independent: &[PathBuf],
@@ -112,6 +148,10 @@ pub(crate) fn validate_upgrade_independent_paths(
         env,
         OpenClawWorkspaceRuntime::for_env(&meta.name, meta.gateway_port),
     )?;
+    let workspace_targets = workspaces
+        .workspace_roots()
+        .map(|workspace| resolve_scope_path(workspace))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut configuration =
         super::openclaw_config_include_paths(&paths.config_path, &paths.state_dir)?;
     configuration.push(paths.config_path.clone());
@@ -152,6 +192,9 @@ pub(crate) fn validate_upgrade_independent_paths(
         if workspaces
             .workspace_roots()
             .any(|workspace| workspace.starts_with(&absolute))
+            || workspace_targets
+                .iter()
+                .any(|workspace| workspace.starts_with(&resolved))
         {
             return Err(format!(
                 "a configured workspace can contain migration-owned state; declare only independent content beneath it: {}",
@@ -161,6 +204,9 @@ pub(crate) fn validate_upgrade_independent_paths(
         if !workspaces
             .workspace_roots()
             .any(|workspace| absolute.starts_with(workspace))
+            && !workspace_targets
+                .iter()
+                .any(|workspace| resolved.starts_with(workspace))
         {
             return Err(format!(
                 "independent paths must be beneath a configured workspace: {}",

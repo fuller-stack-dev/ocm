@@ -337,6 +337,73 @@ fn scope_refuses_configuration_workspace_and_path_escape_exclusions() {
 }
 
 #[test]
+fn configured_workspace_alias_cannot_hide_a_whole_workspace_exclusion() {
+    let fixture = Fixture::new();
+    let alias = fixture.state.join("workspace/workspace-alias");
+    symlink("projects", &alias).unwrap();
+    for workspace in [alias.clone(), alias.join("future-agent")] {
+        fs::write(
+            fixture.state.join("openclaw.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "agents": {"defaults": {"workspace": workspace}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let result = fixture.run(&[
+            "env",
+            "set-independent-paths",
+            "demo",
+            ".openclaw/workspace/projects",
+        ]);
+        assert!(
+            !result.status.success(),
+            "configured workspace target excluded: {}",
+            workspace.display()
+        );
+    }
+    fs::write(
+        fixture.state.join("openclaw.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "agents": {"defaults": {"workspace": alias}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let nested = fixture.run(&[
+        "env",
+        "set-independent-paths",
+        "demo",
+        ".openclaw/workspace/projects/example",
+    ]);
+    assert!(
+        nested.status.success(),
+        "independent child beneath workspace alias refused: {}",
+        stderr(&nested)
+    );
+    fs::remove_file(&alias).unwrap();
+    symlink("missing-projects", &alias).unwrap();
+    let dangling = fixture.run(&[
+        "env",
+        "set-independent-paths",
+        "demo",
+        ".openclaw/workspace/missing-projects",
+    ]);
+    assert!(
+        !dangling.status.success(),
+        "unresolved workspace alias accepted"
+    );
+    let upgrade = fixture.run(&["upgrade", "demo", "--runtime", "new", "--json"]);
+    assert!(
+        !upgrade.status.success(),
+        "changed unresolved scope reached upgrade"
+    );
+    let env = fixture.run(&["env", "show", "demo", "--json"]);
+    let env: Value = serde_json::from_str(&stdout(&env)).unwrap();
+    assert_eq!(env["defaultRuntime"], "old");
+}
+
+#[test]
 fn frozen_scope_and_invalid_metadata_never_fall_back_to_whole_root_restore() {
     let fixture = Fixture::new();
     let ready = fixture.root.child("ready");
