@@ -1313,6 +1313,7 @@ mod tests {
 
     fn meta(name: &str, root: &str, gateway_port: Option<u32>) -> EnvMeta {
         EnvMeta {
+            upgrade_independent_paths: Vec::new(),
             kind: "ocm-env".to_string(),
             name: name.to_string(),
             root: root.to_string(),

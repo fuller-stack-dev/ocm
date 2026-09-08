@@ -164,7 +164,7 @@ checkpoint and previous runtime as the coherent rollback state. A running
 managed service is considered recovered only
 after its HTTP health endpoint responds and OpenClaw's gateway status proves the
 gateway is reachable; otherwise the upgrade follows the normal rollback path.
-New snapshots preserve the complete environment root, including credentials,
+By default, checkpoints preserve the complete environment root, including credentials,
 browser profiles, plugin payloads, unknown future directories, modes, symlinks,
 and SQLite sidecars. OCM verifies tree contents and SQLite integrity before
 publishing the checkpoint. APFS uses copy-on-write clones when available;
@@ -177,6 +177,24 @@ rotation, mode changes, SQLite (even at a log path), and all other state still
 require strict verification. Full-copy checkpoints remain exact. Restore discards only
 explicit process residue such as locks, sockets, PIDs, and temporary runtime
 directories. Legacy tar snapshots remain readable.
+
+If a workspace contains projects that OpenClaw does not migrate, declare their
+directories as independent before upgrading:
+
+```bash
+ocm env set-independent-paths mira .openclaw/workspace/projects
+```
+
+Upgrade checkpoints then omit those directories without reading their contents,
+and rollback restores the surrounding owned state while leaving those directories
+in place. The list is explicit and empty by default; names such as `node_modules`
+never imply ownership. Whole workspaces and configuration files cannot be excluded.
+Memory, identity documents, and legacy migration inputs remain covered unless
+they belong to a directory explicitly declared independent. Declarations require
+operator knowledge of migration ownership: OCM does not prevent OpenClaw itself
+from writing to these directories. See [checkpoint scope](docs/USAGE.md#upgrade-checkpoint-scope)
+for the contract and limitations. Separately requested `env snapshot create`
+backups still include the entire environment.
 
 On APFS, snapshot preparation clones the bulk tree while the gateway is running.
 The final service pause reconciles changed or removed entries and checks changed
@@ -194,7 +212,7 @@ linked upgrade recovery or staged artifact cleanup still needs attention.
 When both OpenClaw versions are known, `upgrade` rejects an older target before
 creating a snapshot, downloading the target, or changing runtime metadata.
 Switching only the binary cannot reverse newer OpenClaw config or SQLite state
-migrations; returning to an older release requires a complete snapshot captured
+migrations; returning to an older release requires a checkpoint of its owned state captured
 while that release and its state schema were active.
 `ocm upgrade history <env>` lists completed upgrade transactions newest first,
 including source and target bindings and versions, the pre-upgrade snapshot,

@@ -956,7 +956,7 @@ impl Cli {
         let interrupt_fence = UpgradeInterruptFence::enter()?;
         let prepared = self
             .environment_service()
-            .prepare_snapshot_capture_locked(env_name)?;
+            .prepare_upgrade_checkpoint_locked(env_name)?;
         let _checkpoint_cleanup = prepared.cleanup_guard();
         let service_state = self
             .service_service()
@@ -4304,7 +4304,7 @@ impl Cli {
         let env_meta = self.environment_service().get(env_name)?;
         let prepared = self
             .environment_service()
-            .prepare_snapshot_capture_locked(env_name)?;
+            .prepare_upgrade_checkpoint_locked(env_name)?;
         let mut seen = BTreeSet::new();
         let checkpoint_cleanup = prepared.cleanup_guard();
         let mut runtime_backups: Vec<RuntimeRollbackBackup> = Vec::new();

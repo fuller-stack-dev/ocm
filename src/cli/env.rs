@@ -1141,6 +1141,7 @@ impl Cli {
             "exec" => self.handle_env_exec(args),
             "resolve" => self.handle_env_resolve(args),
             "run" => self.handle_env_run(args),
+            "set-independent-paths" => self.handle_env_set_independent_paths(args),
             "set-runtime" => self.handle_env_set_runtime(args),
             "set-launcher" => self.handle_env_set_launcher(args),
             "protect" => self.handle_env_protect(args),
@@ -1549,6 +1550,40 @@ impl Cli {
             &default_runtime,
             profile,
         ));
+        Ok(0)
+    }
+
+    pub(super) fn handle_env_set_independent_paths(
+        &self,
+        args: Vec<String>,
+    ) -> Result<i32, String> {
+        let (args, json, _) = self.consume_human_output_flags(args, "env set-independent-paths")?;
+        if args.len() < 2 {
+            return Err(
+                "usage: ocm env set-independent-paths <env> <relative-path>... | none".to_string(),
+            );
+        }
+        let paths = if args.len() == 2 && args[1] == "none" {
+            Vec::new()
+        } else {
+            args[1..].iter().map(std::path::PathBuf::from).collect()
+        };
+        let meta = self
+            .environment_service()
+            .set_upgrade_independent_paths(&args[0], paths)?;
+        if json {
+            self.print_json(&meta)?;
+        } else {
+            self.stdout_lines(vec![format!(
+                "Updated independent upgrade paths for {}: {}",
+                meta.name,
+                meta.upgrade_independent_paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )]);
+        }
         Ok(0)
     }
 

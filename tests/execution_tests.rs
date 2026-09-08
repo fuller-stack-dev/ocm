@@ -12,6 +12,7 @@ use time::OffsetDateTime;
 
 fn sample_env(default_runtime: Option<&str>, default_launcher: Option<&str>) -> EnvMeta {
     EnvMeta {
+        upgrade_independent_paths: Vec::new(),
         kind: "ocm-env".to_string(),
         name: "demo".to_string(),
         root: "/tmp/demo".to_string(),

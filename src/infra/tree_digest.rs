@@ -29,16 +29,28 @@ impl TreeInventoryEntry {
 
 /// Returns a deterministic inventory of a tree without following symlinks.
 pub(crate) fn inventory_tree(root: &Path) -> Result<BTreeMap<PathBuf, TreeInventoryEntry>, String> {
+    inventory_tree_except(root, &[])
+}
+
+/// Checkpoint-owned selection; runtime inventories always use the complete tree.
+pub(crate) fn inventory_tree_except(
+    root: &Path,
+    independent: &[PathBuf],
+) -> Result<BTreeMap<PathBuf, TreeInventoryEntry>, String> {
     let mut out = BTreeMap::new();
-    inventory_path(root, root, &mut out)?;
+    inventory_path(root, root, independent, &mut out)?;
     Ok(out)
 }
 
 fn inventory_path(
     root: &Path,
     path: &Path,
+    independent: &[PathBuf],
     out: &mut BTreeMap<PathBuf, TreeInventoryEntry>,
 ) -> Result<(), String> {
+    if independent.iter().any(|entry| path == root.join(entry)) {
+        return Ok(());
+    }
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
     let relative = path.strip_prefix(root).unwrap_or(path).to_path_buf();
@@ -73,7 +85,7 @@ fn inventory_path(
             .map_err(|error| error.to_string())?;
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
-            inventory_path(root, &entry.path(), out)?;
+            inventory_path(root, &entry.path(), independent, out)?;
         }
     }
     Ok(())

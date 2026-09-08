@@ -1,3 +1,4 @@
+mod checkpoint_scope;
 mod checkpoints;
 mod common;
 mod envs;
@@ -85,7 +86,8 @@ pub use runtimes::{
 pub(crate) use snapshots::{
     EnvSnapshotRestoreTransaction, PreparedEnvSnapshotCapture, commit_env_snapshot_restore,
     create_env_snapshot_from_preparation, prepare_env_snapshot_capture,
-    prepare_env_snapshot_restore, rollback_env_snapshot_restore,
+    prepare_env_snapshot_restore, prepare_upgrade_checkpoint_capture,
+    rollback_env_snapshot_restore, validate_upgrade_independent_paths,
 };
 pub use snapshots::{
     create_env_snapshot, get_env_snapshot, list_all_env_snapshots, list_env_snapshots,
@@ -127,6 +129,7 @@ pub fn summarize_env(meta: &EnvMeta) -> EnvSummary {
         state_dir: display_path(&paths.state_dir),
         config_path: display_path(&paths.config_path),
         workspace_dir: display_path(&paths.workspace_dir),
+        upgrade_independent_paths: meta.upgrade_independent_paths.clone(),
         gateway_port: meta.gateway_port,
         service_enabled: meta.service_enabled,
         service_running: meta.service_running,

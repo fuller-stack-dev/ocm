@@ -438,6 +438,7 @@ fn create_environment_with_runtime_validation(
     });
     let created_at = now_utc();
     let meta = EnvMeta {
+        upgrade_independent_paths: Vec::new(),
         kind: "ocm-env".to_string(),
         name,
         root: display_path(&paths.root),
@@ -636,6 +637,7 @@ fn clone_environment_with_policy(
         };
 
         let meta = EnvMeta {
+            upgrade_independent_paths: Vec::new(),
             kind: "ocm-env".to_string(),
             name,
             root: display_path(&target_paths.root),
@@ -956,6 +958,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
 
             let created_at = now_utc();
             let meta = EnvMeta {
+                upgrade_independent_paths: Vec::new(),
                 kind: "ocm-env".to_string(),
                 name: name.clone(),
                 root: display_path(&target_paths.root),
