@@ -90,6 +90,7 @@ fn prune_selection_uses_last_used_at_and_skips_protected_envs() {
     let now = now_utc();
     let envs = vec![
         EnvMeta {
+            upgrade_independent_paths: Vec::new(),
             kind: "ocm-env".to_string(),
             name: "old".to_string(),
             root: "/tmp/old".to_string(),
@@ -106,6 +107,7 @@ fn prune_selection_uses_last_used_at_and_skips_protected_envs() {
             last_used_at: None,
         },
         EnvMeta {
+            upgrade_independent_paths: Vec::new(),
             kind: "ocm-env".to_string(),
             name: "recently-used".to_string(),
             root: "/tmp/recent".to_string(),
@@ -122,6 +124,7 @@ fn prune_selection_uses_last_used_at_and_skips_protected_envs() {
             last_used_at: Some(now - Duration::days(1)),
         },
         EnvMeta {
+            upgrade_independent_paths: Vec::new(),
             kind: "ocm-env".to_string(),
             name: "protected-old".to_string(),
             root: "/tmp/protected".to_string(),

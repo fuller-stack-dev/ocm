@@ -1217,6 +1217,7 @@ mod tests {
     #[test]
     fn env_list_pretty_uses_a_table() {
         let summaries = vec![EnvSummary {
+            upgrade_independent_paths: Vec::new(),
             name: "demo".to_string(),
             root: "/tmp/demo".to_string(),
             openclaw_home: "/tmp/demo/.openclaw".to_string(),
@@ -1247,6 +1248,7 @@ mod tests {
     fn env_show_pretty_uses_cards() {
         let lines = env_show(
             &EnvSummary {
+                upgrade_independent_paths: Vec::new(),
                 name: "demo".to_string(),
                 root: "/tmp/demo".to_string(),
                 openclaw_home: "/tmp/demo".to_string(),
@@ -1278,6 +1280,7 @@ mod tests {
     fn env_show_pretty_suggests_start_for_unbound_env() {
         let lines = env_show(
             &EnvSummary {
+                upgrade_independent_paths: Vec::new(),
                 name: "bare".to_string(),
                 root: "/tmp/bare".to_string(),
                 openclaw_home: "/tmp/bare".to_string(),
@@ -1723,6 +1726,7 @@ mod tests {
 
     fn sample_snapshot(env_name: &str, label: &str) -> EnvSnapshotSummary {
         EnvSnapshotSummary {
+            upgrade_scope: None,
             id: "snap-001".to_string(),
             env_name: env_name.to_string(),
             label: Some(label.to_string()),
@@ -2308,7 +2312,31 @@ pub fn env_snapshot_show(
         profile.color,
     );
 
+    if let Some(scope) = &snapshot.upgrade_scope {
+        push_card(
+            &mut lines,
+            "Upgrade checkpoint",
+            vec![KeyValueRow::plain(
+                "Preserved on restore",
+                independent_path_names(&scope.independent_paths),
+            )],
+            profile.color,
+        );
+    }
+
     Ok(lines)
+}
+
+fn independent_path_names(paths: &[std::path::PathBuf]) -> String {
+    if paths.is_empty() {
+        "none (whole environment)".to_string()
+    } else {
+        paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 fn env_snapshot_show_raw(snapshot: &EnvSnapshotSummary) -> Result<Vec<String>, String> {
@@ -2319,6 +2347,13 @@ fn env_snapshot_show_raw(snapshot: &EnvSnapshotSummary) -> Result<Vec<String>, S
         format!("storageKind: {}", snapshot.storage_kind),
         format!("sourceRoot: {}", snapshot.source_root),
     ];
+    if let Some(scope) = &snapshot.upgrade_scope {
+        lines.push("purpose: upgrade checkpoint".to_string());
+        lines.push(format!(
+            "preservedOnRestore: {}",
+            independent_path_names(&scope.independent_paths)
+        ));
+    }
     if let Some(label) = snapshot.label.as_deref() {
         lines.push(format!("label: {label}"));
     }
@@ -2421,6 +2456,14 @@ pub fn env_snapshot_restored(
         rows.push(KeyValueRow::warning("Protected", "yes"));
     }
     push_card(&mut lines, "Environment", rows, profile.color);
+    if !restored.warnings.is_empty() {
+        let rows = restored
+            .warnings
+            .iter()
+            .map(|warning| KeyValueRow::warning("Warning", warning.clone()))
+            .collect::<Vec<_>>();
+        lines.extend(render_key_value_card("Warnings", &rows, profile.color));
+    }
     lines
 }
 
@@ -2446,6 +2489,12 @@ fn env_snapshot_restored_raw(restored: &EnvSnapshotRestoreSummary) -> Vec<String
     if restored.protected {
         lines.push("  protected: true".to_string());
     }
+    lines.extend(
+        restored
+            .warnings
+            .iter()
+            .map(|warning| format!("  warning: {warning}")),
+    );
     lines
 }
 

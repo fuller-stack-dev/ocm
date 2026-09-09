@@ -27,7 +27,7 @@ pub(crate) use lifecycle::{CloneEnvironmentResult, ImportEnvironmentResult};
 pub use snapshots::{
     CreateEnvSnapshotOptions, EnvSnapshotRemoveSummary, EnvSnapshotRestoreSummary,
     EnvSnapshotSummary, RemoveEnvSnapshotOptions, RestoreEnvSnapshotOptions,
-    select_snapshot_prune_candidates,
+    UpgradeCheckpointScope, select_snapshot_prune_candidates,
 };
 pub use source_watch::SourceWatchOverride;
 pub(crate) use source_watch::{CreateSourceWatchOverrideOptions, SourceWatchLease};

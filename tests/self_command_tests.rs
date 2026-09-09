@@ -151,6 +151,157 @@ fn self_update_check_reports_when_a_newer_release_exists() {
     assert!(text.contains(&format!("assetName: {asset_name}")));
 }
 
+#[cfg(unix)]
+#[test]
+fn homebrew_self_update_preserves_the_keg_and_allows_checks_through_symlinks() {
+    let root = TestDir::new("self-update-homebrew");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let keg = root.child("brew/custom-cellar/ocm/0.2.39");
+    let binary = keg.join("bin/ocm");
+    fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_ocm"), &binary).unwrap();
+    fs::write(
+        keg.join("INSTALL_RECEIPT.json"),
+        r#"{"homebrew_version":"4.6.0","source":{"tap":"openclaw/tap"}}"#,
+    )
+    .unwrap();
+    let linked = root.child("brew/bin/ocm");
+    fs::create_dir_all(linked.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&binary, &linked).unwrap();
+    let original = file_sha256(&binary).unwrap();
+    let release = TestHttpServer::serve_bytes(
+        "/release.json",
+        "application/json",
+        br#"{"tag_name":"v9.9.9","assets":[]}"#,
+    );
+    let env = release_env(&root, &release.url());
+
+    for command in [&binary, &linked] {
+        let output = run_ocm_binary(command, &cwd, &env, &["self", "update", "--raw"]);
+        assert!(!output.status.success());
+        assert!(
+            stderr(&output).contains("brew upgrade openclaw/tap/ocm"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    assert!(release.requests().is_empty());
+    assert_eq!(file_sha256(&binary).unwrap(), original);
+    assert_eq!(fs::read_dir(keg.join("bin")).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(root.child("ocm-home")).unwrap().count(), 0);
+
+    let output = run_ocm_binary(&linked, &cwd, &env, &["self", "update", "--check", "--raw"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("status: update_available"));
+    assert_eq!(release.requests().len(), 1);
+    assert_eq!(file_sha256(&binary).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn npm_self_update_preserves_global_local_and_npx_payloads() {
+    use crate::support::npm_fixture;
+
+    for (location, guidance) in [
+        (
+            "custom-prefix/lib/node_modules/@openclaw/ocm",
+            "same npm prefix",
+        ),
+        ("project/node_modules/@openclaw/ocm", "owning project"),
+        ("lib/node_modules/@openclaw/ocm", "owning project"),
+        (
+            "custom-cache/_npx/hash/node_modules/@openclaw/ocm",
+            "temporary",
+        ),
+    ] {
+        let root = TestDir::new("self-update-npm");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let Some((entrypoint, binary)) = npm_fixture(&root.child(location)) else {
+            return;
+        };
+        if location.starts_with("custom-prefix/") {
+            let global = root.child("custom-prefix/bin/ocm");
+            fs::create_dir_all(global.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&entrypoint, &global).unwrap();
+        }
+        let linked = root.child("linked-ocm");
+        std::os::unix::fs::symlink(&entrypoint, &linked).unwrap();
+        let release = TestHttpServer::serve_bytes(
+            "/release.json",
+            "application/json",
+            br#"{"tag_name":"v9.9.9","assets":[]}"#,
+        );
+        let env = release_env(&root, &release.url());
+        let original = file_sha256(&binary).unwrap();
+        for command in [&binary, &entrypoint, &linked] {
+            let output = run_ocm_binary(
+                command,
+                &cwd,
+                &env,
+                &["--color", "never", "self", "update", "--raw"],
+            );
+            assert!(!output.status.success());
+            assert!(stderr(&output).contains(guidance), "{}", stderr(&output));
+        }
+        assert!(release.requests().is_empty());
+        assert_eq!(file_sha256(&binary).unwrap(), original);
+        assert_eq!(fs::read_dir(binary.parent().unwrap()).unwrap().count(), 1);
+        let output = run_ocm_binary(
+            &linked,
+            &cwd,
+            &env,
+            &["self", "update", "--check", "--json"],
+        );
+        assert!(output.status.success(), "{}", stderr(&output));
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            result["packageManagerNote"]
+                .as_str()
+                .unwrap()
+                .contains("not npm availability")
+        );
+        assert_eq!(release.requests().len(), 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn npm_owner_requires_manifest_identity_not_path_or_environment_alone() {
+    let root = TestDir::new("self-update-npm-identity");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let Some((_, binary)) = crate::support::npm_fixture(&root.child("node_modules/ocm-alias"))
+    else {
+        return;
+    };
+    let package = binary
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let release = TestHttpServer::serve_bytes_times(
+        "/release.json",
+        "application/json",
+        br#"{"tag_name":"v0.0.0","assets":[]}"#,
+        2,
+    );
+    let mut env = release_env(&root, &release.url());
+    env.insert("OCM_MANAGED_BY_NPM".to_string(), "1".to_string());
+    for manifest in ["not json", r#"{"name":"unrelated","version":"9.0.0"}"#] {
+        fs::write(package.join("package.json"), manifest).unwrap();
+        let output = run_ocm_binary(&binary, &cwd, &env, &["self", "update", "--raw"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert!(stdout(&output).contains("up_to_date"));
+    }
+    assert_eq!(release.requests().len(), 2);
+}
+
 #[test]
 fn self_update_check_ignores_older_latest_release_when_current_is_newer() {
     let root = TestDir::new("self-update-check-older-latest");

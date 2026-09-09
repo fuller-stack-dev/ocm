@@ -221,9 +221,23 @@ if [ "${{1:-}}" = "gateway" ] && [ "${{2:-}}" = "status" ]; then
   exit 0
 fi
 if [ "${{1:-}}" = "gateway" ]; then
-  trap 'printf "%s\n" "$$" >> "{stopped}"; exit 0' TERM INT
   printf '%s\n' "$$" >> '{started}'
-  while :; do sleep 3600; done
+  exec node - "${{4:-0}}" '{stopped}' <<'NODE'
+const http = require('node:http');
+const fs = require('node:fs');
+const port = Number(process.argv[2]);
+const stop = () => {{
+  fs.appendFileSync(process.argv[3], `${{process.pid}}\n`);
+  process.exit(0);
+}};
+process.on('SIGTERM', stop);
+process.on('SIGINT', stop);
+const server = http.createServer((request, response) => {{
+  response.writeHead(request.url === '/health' ? 200 : 404);
+  response.end(request.url === '/health' ? 'ok' : 'not found');
+}});
+server.listen(port, '127.0.0.1');
+NODE
 fi
 case "${{1:-}}" in
   --version)
@@ -441,6 +455,7 @@ fn write_self_refreshing_gateway_script(
     refresh_pid_path: &Path,
     refresh_output_path: &Path,
     process_groups_path: &Path,
+    ocm: &Path,
 ) {
     let refresh_launcher = path.with_extension("refresh-ocm");
     write_executable_script(
@@ -453,7 +468,7 @@ printf 'gateway_pid=%s gateway_pgid=%s refresh_pid=%s refresh_pgid=%s\n' \
 exec '{ocm}' "$@"
 "#,
             process_groups_path = path_string(process_groups_path),
-            ocm = path_string(&ocm_test_binary_path()),
+            ocm = path_string(ocm),
         ),
     );
     write_executable_script(
@@ -1372,6 +1387,17 @@ exec '{ocm}' "$@"
 #[cfg(unix)]
 #[test]
 fn gateway_owned_daemon_refresh_survives_its_source_process_group() {
+    gateway_owned_daemon_refresh(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn npm_gateway_owned_daemon_refresh_survives_its_source_process_group() {
+    gateway_owned_daemon_refresh(true);
+}
+
+#[cfg(unix)]
+fn gateway_owned_daemon_refresh(npm: bool) {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("gateway-owned-daemon-refresh");
     let cwd = root.child("workspace");
@@ -1401,6 +1427,16 @@ fn gateway_owned_daemon_refresh_survives_its_source_process_group() {
     let refresh_output_path = root.child("refresh-output");
     let process_groups_path = root.child("process-groups");
     let runtime_path = root.child("bin/openclaw");
+    let ocm = if npm {
+        let Some((entrypoint, _)) =
+            crate::support::npm_fixture(&root.child("prefix/lib/node_modules/@openclaw/ocm"))
+        else {
+            return;
+        };
+        entrypoint
+    } else {
+        ocm_test_binary_path()
+    };
     write_self_refreshing_gateway_script(
         &runtime_path,
         &started_path,
@@ -1408,6 +1444,7 @@ fn gateway_owned_daemon_refresh_survives_its_source_process_group() {
         &refresh_pid_path,
         &refresh_output_path,
         &process_groups_path,
+        &ocm,
     );
 
     let add = run_ocm(

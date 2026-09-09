@@ -44,15 +44,18 @@ fn build_candidate(root: &TestDir) -> PathBuf {
             "version = \"9.9.9\"",
             1,
         );
-    fs::write(
-        package.join("Cargo.toml"),
-        format!(
-            "{manifest}\n[lib]\npath = {:?}\n[[bin]]\nname = \"ocm\"\npath = {:?}\n",
-            source.join("src/lib.rs"),
-            source.join("src/main.rs")
-        ),
-    )
-    .unwrap();
+    // The current package already declares both targets. Relocate their paths
+    // without adding duplicate target tables to the isolated release manifest.
+    let manifest = manifest
+        .replace(
+            "path = \"src/lib.rs\"",
+            &format!("path = {:?}", source.join("src/lib.rs")),
+        )
+        .replace(
+            "path = \"src/main.rs\"",
+            &format!("path = {:?}", source.join("src/main.rs")),
+        );
+    fs::write(package.join("Cargo.toml"), manifest).unwrap();
     let lock = fs::read_to_string(source.join("Cargo.lock"))
         .unwrap()
         .replace(

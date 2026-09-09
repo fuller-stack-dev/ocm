@@ -41,6 +41,8 @@ pub struct EnvMeta {
     pub kind: String,
     pub name: String,
     pub root: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upgrade_independent_paths: Vec<std::path::PathBuf>,
     pub gateway_port: Option<u32>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub gateway_port_auto_assigned: bool,
@@ -70,6 +72,7 @@ pub struct EnvSummary {
     pub state_dir: String,
     pub config_path: String,
     pub workspace_dir: String,
+    pub upgrade_independent_paths: Vec<std::path::PathBuf>,
     pub gateway_port: Option<u32>,
     pub service_enabled: bool,
     pub service_running: bool,

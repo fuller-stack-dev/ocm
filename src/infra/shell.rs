@@ -273,6 +273,7 @@ mod tests {
     #[test]
     fn build_openclaw_env_preserves_diagnostics_passthrough_only() {
         let meta = EnvMeta {
+            upgrade_independent_paths: Vec::new(),
             kind: "ocm-env".to_string(),
             name: "demo".to_string(),
             root: "/tmp/ocm/envs/demo".to_string(),
@@ -372,6 +373,7 @@ mod tests {
     #[test]
     fn build_openclaw_dev_source_env_points_bundled_plugins_at_source_extensions() {
         let meta = EnvMeta {
+            upgrade_independent_paths: Vec::new(),
             kind: "ocm-env".to_string(),
             name: "demo".to_string(),
             root: "/tmp/ocm/envs/demo".to_string(),
@@ -415,6 +417,7 @@ mod tests {
     #[test]
     fn activation_unsets_only_valid_stale_control_names() {
         let meta = EnvMeta {
+            upgrade_independent_paths: Vec::new(),
             kind: "ocm-env".to_string(),
             name: "demo".to_string(),
             root: "/tmp/ocm/envs/demo".to_string(),

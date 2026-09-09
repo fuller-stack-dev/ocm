@@ -437,6 +437,51 @@ Clone copies the workspace and env config into a new environment, gives the clon
 ocm start rowan
 ```
 
+### Upgrade checkpoint scope
+
+By default, upgrade and rollback safety checkpoints cover the full environment.
+To keep independent projects current across core upgrades and rollbacks, declare
+their directories before the upgrade:
+
+```bash
+ocm env set-independent-paths mira .openclaw/workspace/projects .openclaw/workspace/worktrees
+ocm env show mira --json
+ocm env set-independent-paths mira none
+```
+
+The command replaces the list. Paths are relative to the environment root, must
+be strictly beneath a configured workspace, and must name directories. A declared
+directory may be absent if its parents exist. Parents must be real directories;
+symlinks within an independent directory remain untouched. Individual files cannot
+be declared independently, keeping SQLite databases and their adjacent WAL and
+journal files together. Paths cannot overlap, escape the environment, contain
+configuration or its includes, or encompass a configured workspace.
+
+Only declare content that OpenClaw and its migrations do not own. Workspace memory,
+identity, legacy state, and other meaningful files are not disposable. OCM cannot
+discover every plugin or migration's write footprint, and this setting does not
+sandbox runtime writes. Unclassified state remains covered, including credentials,
+unknown runtime directories, and migration inputs outside the declared directories.
+
+Preparation, stopped capture, and rollback validation do not traverse independent
+directories. Restore replaces owned entries around them; it leaves current
+independent bytes, modes, timestamps, extended attributes, symlinks, additions,
+and deletions in place. Shared ancestor directories stay in place, but their
+metadata can change when owned siblings are replaced. Existing service-log and
+socket rules and SQLite validation still apply to the captured state.
+
+Each upgrade checkpoint records its scope. Changing the environment's current
+list affects future checkpoints only. Old whole-root checkpoints still restore
+the whole root; declaring independent paths does not retrofit them. Scoped
+checkpoints use a new kind that older OCM versions refuse to restore. Missing or
+invalid scope metadata is rejected. Restore reverses completed moves if a later
+move fails and retains displaced owned entries until service acceptance; it does
+not add crash recovery for an uncatchable process or machine failure.
+
+This policy belongs to the environment registration. Clone and import start with
+an empty list. A separately requested full snapshot, export, or clone still
+includes independent content. Full snapshot restore still rewinds that content.
+
 ### Snapshots
 
 Snapshot create and restore stop a running OCM-managed gateway before copying or
@@ -445,6 +490,15 @@ verified whole-root checkpoints: they include secrets, browser state, SQLite
 sidecars, modes, symlinks, plugin data, and unknown future paths. Restore stages
 an exclusive candidate beside the live root and retains the displaced root
 until service acceptance; failed acceptance restores the displaced root.
+
+Unix sockets are transient process endpoints and are omitted from checkpoints,
+including inactive socket files left by stopped processes. Snapshot creation
+leaves source endpoints untouched. Restore does not recreate sockets; their
+owning processes create them when needed. This rule uses the entry's file type,
+so ordinary files named `*.sock` and symlinks remain part of the checkpoint.
+Other unsupported special entries, such as FIFOs and devices, are rejected
+during preparation before a running gateway is stopped. Final capture also
+checks for unsupported entries introduced after preparation.
 
 APFS checkpoints begin as space-efficient copy-on-write clones. Other
 filesystems require a full metadata-preserving copy. Plan space for checkpoint

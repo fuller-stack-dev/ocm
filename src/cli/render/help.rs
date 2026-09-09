@@ -751,6 +751,10 @@ pub fn env_help(cmd: &str) -> String {
                 &[
                     ("set-launcher", "Bind or clear a launcher"),
                     ("set-runtime", "Bind or clear a runtime"),
+                    (
+                        "set-independent-paths",
+                        "Preserve declared project paths during upgrades",
+                    ),
                     ("resolve", "Show what the environment would run"),
                 ],
             ),
@@ -1382,6 +1386,23 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
                 "When source watch is active for this env, OCM runs node <checkout>/openclaw.mjs directly instead of rebuilding through the package script.",
                 "If an environment is active, you can also use the root-level `--` shortcut.",
                 "For one-shot explicit env runs, use the root-level `@<env>` shortcut.",
+            ],
+        ),
+        "set-independent-paths" => render_leaf(
+            "Set independent upgrade paths",
+            "Declare content beneath configured workspaces that core upgrades must not checkpoint or rewind. This replaces the previous list; use none to clear it.",
+            vec![
+                format!("{cmd} env set-independent-paths <name> <relative-path>... [--json]"),
+                format!("{cmd} env set-independent-paths <name> none [--json]"),
+            ],
+            &[],
+            vec![format!(
+                "{cmd} env set-independent-paths mira .openclaw/workspace/projects"
+            )],
+            &[
+                "Paths name directories relative to the environment root. Configuration, config includes and entire configured workspaces cannot be declared independent.",
+                "Declare only content that core and plugin migrations do not own. OCM does not sandbox runtime writes into declared paths.",
+                "Full snapshots still include these paths. Existing checkpoints keep the scope recorded when they were captured.",
             ],
         ),
         "set-runtime" => render_leaf(

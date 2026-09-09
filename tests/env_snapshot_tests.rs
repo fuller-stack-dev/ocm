@@ -341,6 +341,76 @@ fn env_snapshot_restore_reverts_state_from_the_selected_snapshot() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn accepted_snapshot_restore_reports_cleanup_failure_without_failing() {
+    for json in [false, true] {
+        let root = TestDir::new("snapshot-cleanup-warning");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let notes = root.child("ocm-home/envs/source/.openclaw/workspace/notes.txt");
+        write_text(&notes, "checkpoint bytes\n");
+        let snapshot = run_ocm(
+            &cwd,
+            &env,
+            &["env", "snapshot", "create", "source", "--json"],
+        );
+        assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+        let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+        write_text(&notes, "displaced bytes\n");
+        assert!(
+            Command::new("/usr/bin/chflags")
+                .arg("uchg")
+                .arg(&notes)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut args = vec![
+            "env",
+            "snapshot",
+            "restore",
+            "source",
+            snapshot["id"].as_str().unwrap(),
+        ];
+        args.push(if json { "--json" } else { "--raw" });
+        let restore = run_ocm(&cwd, &env, &args);
+        let retained = fs::read_dir(root.child("ocm-home/envs"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().contains("ocm-restore"))
+            .expect("cleanup residue must remain available");
+        let displaced = retained
+            .path()
+            .join("displaced/.openclaw/workspace/notes.txt");
+        assert!(
+            Command::new("/usr/bin/chflags")
+                .arg("nouchg")
+                .arg(&displaced)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(restore.status.success(), "{}", stderr(&restore));
+        assert_eq!(fs::read_to_string(notes).unwrap(), "checkpoint bytes\n");
+        assert_eq!(fs::read_to_string(displaced).unwrap(), "displaced bytes\n");
+        assert!(
+            stdout(&restore).contains("cleanup requires attention"),
+            "{}",
+            stdout(&restore)
+        );
+        if json {
+            let result: Value = serde_json::from_str(&stdout(&restore)).unwrap();
+            assert_eq!(result["warnings"].as_array().unwrap().len(), 1);
+        } else {
+            assert!(stdout(&restore).contains("warning: "));
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn env_snapshot_restores_the_complete_durable_root_with_metadata_and_sqlite() {
@@ -393,6 +463,11 @@ fn env_snapshot_restores_the_complete_durable_root_with_metadata_and_sqlite() {
     assert!(database_wal.exists());
     assert!(database_shm.exists());
     let expected_wal = fs::read(&database_wal).unwrap();
+    #[cfg(target_os = "macos")]
+    let log_relative = ".openclaw-rosita-node/logs/node.error.log";
+    #[cfg(target_os = "macos")]
+    let log_writer =
+        support::active_service_log::ActiveServiceLog::start(&env_root.join(log_relative));
 
     let snapshot = run_ocm(
         &cwd,
@@ -402,6 +477,16 @@ fn env_snapshot_restores_the_complete_durable_root_with_metadata_and_sqlite() {
     assert!(snapshot.status.success(), "{}", stderr(&snapshot));
     let snapshot_json: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
     let snapshot_id = snapshot_json["id"].as_str().unwrap();
+    #[cfg(target_os = "macos")]
+    let captured_log = {
+        let final_log = log_writer.finish();
+        let checkpoint = Path::new(snapshot_json["archivePath"].as_str().unwrap());
+        let captured = fs::read(checkpoint.join(log_relative)).unwrap();
+        assert!(!captured.is_empty());
+        assert!(final_log.starts_with(&captured));
+        fs::write(env_root.join(log_relative), b"changed after snapshot\n").unwrap();
+        captured
+    };
     drop(database);
 
     write_text(&dotenv, "OPENCLAW_SENTINEL=after\n");
@@ -460,6 +545,8 @@ fn env_snapshot_restores_the_complete_durable_root_with_metadata_and_sqlite() {
     );
     assert_eq!(fs::read_link(&future_link).unwrap(), Path::new("state.txt"));
     assert_eq!(fs::read(&database_wal).unwrap(), expected_wal);
+    #[cfg(target_os = "macos")]
+    assert_eq!(fs::read(env_root.join(log_relative)).unwrap(), captured_log);
     assert!(fs::metadata(&database_shm).unwrap().len() > 0);
 
     let restored = Connection::open_with_flags(
@@ -1686,6 +1773,70 @@ fn env_snapshot_removes_partial_artifacts_when_sqlite_snapshot_fails() {
     assert_eq!(shown["serviceRunning"], true);
 }
 
+#[cfg(unix)]
+#[test]
+fn env_snapshot_refuses_fifo_before_stopping_the_running_gateway() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+
+    let root = TestDir::new("env-snapshot-fifo-preflight");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let health = TestHttpServer::serve_bytes_times("/health", "text/plain", b"ok", 10);
+    let port = url::Url::parse(&health.url()).unwrap().port().unwrap() as u32;
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "stable", "--command", "openclaw"],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--port",
+            &port.to_string(),
+            "--launcher",
+            "stable",
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let started = run_ocm(&cwd, &env, &["service", "start", "source"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+    write_running_snapshot_service(&root, &cwd, &env, port);
+
+    let fifo = root.child("ocm-home/envs/source/unsupported");
+    let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+    fs::write(root.child("launchctl.log"), "").unwrap();
+    let snapshot = run_ocm(&cwd, &env, &["env", "snapshot", "create", "source"]);
+    assert_eq!(snapshot.status.code(), Some(1));
+    assert!(
+        stderr(&snapshot).contains("unsupported special file in checkpoint"),
+        "{}",
+        stderr(&snapshot)
+    );
+    assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+    assert!(!root.child("ocm-home/snapshots/source").exists());
+    let lifecycle = fs::read_to_string(root.child("launchctl.log")).unwrap();
+    assert!(!lifecycle.contains("bootout "), "{lifecycle}");
+    let shown = run_ocm(&cwd, &env, &["env", "show", "source", "--json"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    assert_eq!(shown["serviceEnabled"], true);
+    assert_eq!(shown["serviceRunning"], true);
+}
+
 #[test]
 fn env_snapshot_rechecks_sqlite_mutated_after_preflight_and_restores_service() {
     let root = TestDir::new("env-snapshot-sqlite-mutated-after-preflight");
@@ -1741,6 +1892,9 @@ fn env_snapshot_rechecks_sqlite_mutated_after_preflight_and_restores_service() {
     let ocm_home = env.get("OCM_HOME").unwrap().clone();
     let observer_done = Arc::new(AtomicBool::new(false));
     let observer_mutated = Arc::new(AtomicBool::new(false));
+    let cleanup_deferred = Arc::new(AtomicBool::new(false));
+    let cleanup_deferred_thread = Arc::clone(&cleanup_deferred);
+    let snapshot_dir = root.child("ocm-home/snapshots/source");
     let observer_done_thread = Arc::clone(&observer_done);
     let observer_mutated_thread = Arc::clone(&observer_mutated);
     let observer_database = database_path.clone();
@@ -1757,6 +1911,11 @@ fn env_snapshot_rechecks_sqlite_mutated_after_preflight_and_restores_service() {
                 .unwrap_or(last_running);
             if desired_running != last_running {
                 if desired_running {
+                    cleanup_deferred_thread.store(
+                        fs::read_dir(&snapshot_dir)
+                            .is_ok_and(|mut entries| entries.next().is_some()),
+                        Ordering::Relaxed,
+                    );
                     fs::write(&observer_runtime_path, &running_runtime).unwrap();
                 } else {
                     fs::write(
@@ -1778,6 +1937,10 @@ fn env_snapshot_rechecks_sqlite_mutated_after_preflight_and_restores_service() {
     observer.join().unwrap();
 
     assert!(observer_mutated.load(Ordering::Relaxed));
+    assert!(
+        cleanup_deferred.load(Ordering::Relaxed),
+        "failed backup must survive until service restoration, not be deleted during the outage"
+    );
     assert_eq!(snapshot.status.code(), Some(1));
     assert!(
         stderr(&snapshot).contains("SQLite"),
