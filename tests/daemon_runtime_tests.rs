@@ -221,9 +221,23 @@ if [ "${{1:-}}" = "gateway" ] && [ "${{2:-}}" = "status" ]; then
   exit 0
 fi
 if [ "${{1:-}}" = "gateway" ]; then
-  trap 'printf "%s\n" "$$" >> "{stopped}"; exit 0' TERM INT
   printf '%s\n' "$$" >> '{started}'
-  while :; do sleep 3600; done
+  exec node - "${{4:-0}}" '{stopped}' <<'NODE'
+const http = require('node:http');
+const fs = require('node:fs');
+const port = Number(process.argv[2]);
+const stop = () => {{
+  fs.appendFileSync(process.argv[3], `${{process.pid}}\n`);
+  process.exit(0);
+}};
+process.on('SIGTERM', stop);
+process.on('SIGINT', stop);
+const server = http.createServer((request, response) => {{
+  response.writeHead(request.url === '/health' ? 200 : 404);
+  response.end(request.url === '/health' ? 'ok' : 'not found');
+}});
+server.listen(port, '127.0.0.1');
+NODE
 fi
 case "${{1:-}}" in
   --version)
