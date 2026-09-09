@@ -3393,16 +3393,14 @@ fn upgrade_rolls_back_runtime_when_service_restart_fails() {
     assert_eq!(runtime_json["releaseVersion"], "2026.3.24");
 
     let target_runtime = run_ocm(&cwd, &env, &["runtime", "show", "2026.3.25", "--json"]);
+    // Recovery has not been accepted. Preserve diagnostic/recovery state rather
+    // than discarding it before the restored service can start.
     assert!(
-        !target_runtime.status.success(),
-        "{}",
-        stdout(&target_runtime)
-    );
-    assert!(
-        stderr(&target_runtime).contains("runtime \"2026.3.25\" does not exist"),
+        target_runtime.status.success(),
         "{}",
         stderr(&target_runtime)
     );
+    assert!(output.contains("restore operation retained at"), "{output}");
 
     let restored = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
     assert!(restored.status.success(), "{}", stderr(&restored));
@@ -4045,7 +4043,7 @@ fn upgrade_holds_the_environment_operation_lock_until_completion() {
 }
 
 #[cfg(unix)]
-fn assert_interrupted_upgrade_restores_service(start_running: bool) {
+fn assert_interrupted_upgrade_restores_service(start_running: bool, cleanup_failure: bool) {
     let root = TestDir::new(if start_running {
         "upgrade-interrupt-running"
     } else {
@@ -4198,6 +4196,18 @@ fn assert_interrupted_upgrade_restores_service(start_running: bool) {
         );
     }
 
+    if cleanup_failure {
+        let retained = root.child("ocm-home/envs/demo/.openclaw/workspace/cleanup-blocker");
+        write_text(&retained, "displaced target bytes\n");
+        assert!(
+            Command::new("/usr/bin/chflags")
+                .arg("uchg")
+                .arg(&retained)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
     let signal_result = unsafe { libc::kill(upgrade.id() as i32, libc::SIGTERM) };
     assert_eq!(signal_result, 0, "failed to signal upgrade process");
     fs::write(&finalize_release, "").unwrap();
@@ -4206,6 +4216,45 @@ fn assert_interrupted_upgrade_restores_service(start_running: bool) {
     observer.join().unwrap();
     stop_converging_health_server(health_port, &health_stop, health_handle);
 
+    if cleanup_failure {
+        let retained = fs::read_dir(root.child("ocm-home/envs"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().contains("ocm-restore"))
+            .expect("failed cleanup must preserve its operation namespace");
+        let blocker = retained
+            .path()
+            .join("displaced/.openclaw/workspace/cleanup-blocker");
+        // Release only the test-owned flag before any assertion can panic.
+        assert!(
+            Command::new("/usr/bin/chflags")
+                .arg("nouchg")
+                .arg(&blocker)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            fs::read_to_string(blocker).unwrap(),
+            "displaced target bytes\n"
+        );
+        assert!(
+            stdout(&output).contains("cleanup requires attention"),
+            "{}",
+            stdout(&output)
+        );
+        let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
+        assert!(
+            stdout(&history).contains("cleanup requires attention"),
+            "{}",
+            stdout(&history)
+        );
+        assert!(
+            !root
+                .child("ocm-home/envs/demo/.openclaw/workspace/cleanup-blocker")
+                .exists()
+        );
+    }
     assert!(!output.status.success(), "{}", stdout(&output));
     let receipt: Value = serde_json::from_str(&stdout(&output)).unwrap();
     assert_eq!(receipt["outcome"], "rolled-back");
@@ -4228,13 +4277,25 @@ fn assert_interrupted_upgrade_restores_service(start_running: bool) {
 #[cfg(unix)]
 #[test]
 fn interrupted_upgrade_restores_a_running_service() {
-    assert_interrupted_upgrade_restores_service(true);
+    assert_interrupted_upgrade_restores_service(true, false);
 }
 
 #[cfg(unix)]
 #[test]
 fn interrupted_upgrade_keeps_a_stopped_service_stopped() {
-    assert_interrupted_upgrade_restores_service(false);
+    assert_interrupted_upgrade_restores_service(false, false);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn rollback_cleanup_failure_does_not_prevent_service_recovery() {
+    assert_interrupted_upgrade_restores_service(true, true);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn rollback_cleanup_failure_keeps_stopped_service_stopped() {
+    assert_interrupted_upgrade_restores_service(false, true);
 }
 
 #[test]

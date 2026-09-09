@@ -341,6 +341,76 @@ fn env_snapshot_restore_reverts_state_from_the_selected_snapshot() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn accepted_snapshot_restore_reports_cleanup_failure_without_failing() {
+    for json in [false, true] {
+        let root = TestDir::new("snapshot-cleanup-warning");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let notes = root.child("ocm-home/envs/source/.openclaw/workspace/notes.txt");
+        write_text(&notes, "checkpoint bytes\n");
+        let snapshot = run_ocm(
+            &cwd,
+            &env,
+            &["env", "snapshot", "create", "source", "--json"],
+        );
+        assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+        let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+        write_text(&notes, "displaced bytes\n");
+        assert!(
+            Command::new("/usr/bin/chflags")
+                .arg("uchg")
+                .arg(&notes)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut args = vec![
+            "env",
+            "snapshot",
+            "restore",
+            "source",
+            snapshot["id"].as_str().unwrap(),
+        ];
+        args.push(if json { "--json" } else { "--raw" });
+        let restore = run_ocm(&cwd, &env, &args);
+        let retained = fs::read_dir(root.child("ocm-home/envs"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().contains("ocm-restore"))
+            .expect("cleanup residue must remain available");
+        let displaced = retained
+            .path()
+            .join("displaced/.openclaw/workspace/notes.txt");
+        assert!(
+            Command::new("/usr/bin/chflags")
+                .arg("nouchg")
+                .arg(&displaced)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(restore.status.success(), "{}", stderr(&restore));
+        assert_eq!(fs::read_to_string(notes).unwrap(), "checkpoint bytes\n");
+        assert_eq!(fs::read_to_string(displaced).unwrap(), "displaced bytes\n");
+        assert!(
+            stdout(&restore).contains("cleanup requires attention"),
+            "{}",
+            stdout(&restore)
+        );
+        if json {
+            let result: Value = serde_json::from_str(&stdout(&restore)).unwrap();
+            assert_eq!(result["warnings"].as_array().unwrap().len(), 1);
+        } else {
+            assert!(stdout(&restore).contains("warning: "));
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn env_snapshot_restores_the_complete_durable_root_with_metadata_and_sqlite() {

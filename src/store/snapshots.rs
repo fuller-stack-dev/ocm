@@ -74,6 +74,15 @@ pub(crate) struct EnvSnapshotRestoreTransaction {
     independent: Vec<PathBuf>,
 }
 
+impl EnvSnapshotRestoreTransaction {
+    pub(crate) fn retained_operation_note(&self) -> String {
+        format!(
+            "restore operation retained at {}",
+            display_path(&self.operation_root)
+        )
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PreparedEnvSnapshotCapture {
     env_name: String,
@@ -436,9 +445,7 @@ pub fn restore_env_snapshot(
     cwd: &Path,
 ) -> Result<EnvSnapshotRestoreSummary, String> {
     let transaction = prepare_env_snapshot_restore(options, env, cwd)?;
-    let summary = transaction.summary.clone();
-    commit_env_snapshot_restore(transaction)?;
-    Ok(summary)
+    Ok(commit_env_snapshot_restore(transaction))
 }
 
 pub(crate) fn prepare_env_snapshot_restore(
@@ -588,6 +595,7 @@ pub(crate) fn prepare_env_snapshot_restore(
                     default_runtime: meta.default_runtime.clone(),
                     default_launcher: meta.default_launcher.clone(),
                     protected: meta.protected,
+                    warnings: Vec::new(),
                 },
                 original: current.clone(),
                 operation_root: operation.root.clone(),
@@ -628,14 +636,17 @@ pub(crate) fn prepare_env_snapshot_restore(
 }
 
 pub(crate) fn commit_env_snapshot_restore(
-    transaction: EnvSnapshotRestoreTransaction,
-) -> Result<(), String> {
-    remove_tree_if_present(&transaction.operation_root).map_err(|error| {
-        format!(
-            "restored snapshot was accepted, but its operation namespace {} could not be removed: {error}",
+    mut transaction: EnvSnapshotRestoreTransaction,
+) -> EnvSnapshotRestoreSummary {
+    // Acceptance is complete. Discarding displaced bytes cannot undo it or
+    // prevent the caller from recovering the restored service.
+    if let Err(error) = remove_tree_if_present(&transaction.operation_root) {
+        transaction.summary.warnings.push(format!(
+            "restored snapshot was accepted; cleanup requires attention at {}: {error}",
             display_path(&transaction.operation_root)
-        )
-    })
+        ));
+    }
+    transaction.summary
 }
 
 pub(crate) fn rollback_env_snapshot_restore(

@@ -1399,25 +1399,28 @@ impl Cli {
             }
         }
 
-        if let Err(error) =
-            self.environment_service()
-                .restore_snapshot_locked(RestoreEnvSnapshotOptions {
-                    env_name: env_name.to_string(),
-                    snapshot_id: plan.record.snapshot_id.clone(),
-                })
-        {
-            return Ok(self.fail_upgrade_rollback_locked(
-                env_name,
-                &plan,
-                transaction,
-                format!("failed to restore the recorded pre-upgrade snapshot: {error}"),
-            ));
-        }
+        let restore = match self.environment_service().prepare_snapshot_restore_locked(
+            RestoreEnvSnapshotOptions {
+                env_name: env_name.to_string(),
+                snapshot_id: plan.record.snapshot_id.clone(),
+            },
+        ) {
+            Ok(restore) => restore,
+            Err(error) => {
+                return Ok(self.fail_upgrade_rollback_locked(
+                    env_name,
+                    &plan,
+                    transaction,
+                    format!("failed to restore the recorded pre-upgrade snapshot: {error}"),
+                ));
+            }
+        };
 
         let service_action = match self.reconcile_rolled_back_service_locked(env_name, &plan.record)
         {
             Ok(action) => action,
             Err(error) => {
+                let error = format!("{error}; {}", restore.retained_operation_note());
                 return Ok(self.fail_upgrade_rollback_locked(env_name, &plan, transaction, error));
             }
         };
@@ -1432,10 +1435,20 @@ impl Cli {
                     env_name,
                     &plan,
                     transaction,
-                    format!("post-rollback verification failed: {error}"),
+                    format!(
+                        "post-rollback verification failed: {error}; {}",
+                        restore.retained_operation_note()
+                    ),
                 ));
             }
         };
+        let restored = self
+            .environment_service()
+            .commit_snapshot_restore_locked(restore);
+        transaction.cleanup_note =
+            (!restored.warnings.is_empty()).then(|| restored.warnings.join("; "));
+        let verification_note =
+            join_optional_warnings(verification_note, transaction.cleanup_note.clone());
         transaction.mark_post_update_not_needed();
 
         let history_summary = UpgradeEnvSummary {
@@ -1534,18 +1547,27 @@ impl Cli {
         &self,
         env_name: &str,
         plan: &UpgradeRollbackPlan,
-        transaction: UpgradeTransaction,
+        mut transaction: UpgradeTransaction,
         error: String,
     ) -> UpgradeRollbackSummary {
         let rollback_transaction_id = transaction.id.clone();
         let safety_snapshot_id = transaction.snapshot_id.clone();
         let restore_result = self.rollback_upgrade_locked(env_name, &transaction);
+        if let Ok(cleanup_note) = &restore_result {
+            transaction.cleanup_note = cleanup_note.clone();
+        }
         let restored_pre_rollback_state = restore_result.is_ok();
         let (outcome, rollback, note) = match restore_result {
-            Ok(()) => (
+            Ok(cleanup_warning) => (
                 "failed".to_string(),
                 "restored".to_string(),
-                format!("rollback failed, so ocm restored the pre-rollback state: {error}"),
+                join_optional_warnings(
+                    Some(format!(
+                        "rollback failed, so ocm restored the pre-rollback state: {error}"
+                    )),
+                    cleanup_warning,
+                )
+                .unwrap(),
             ),
             Err(restore_error) => (
                 "rollback-failed".to_string(),
@@ -4418,6 +4440,7 @@ impl Cli {
 
         Ok(UpgradeTransaction {
             id,
+            cleanup_note: None,
             _checkpoint_cleanup: checkpoint_cleanup,
             snapshot_id: snapshot.id,
             runtime_backups,
@@ -4623,7 +4646,9 @@ impl Cli {
             },
             rollback: summary.rollback.clone(),
             rollback_of: transaction.rollback_of.clone(),
-            note: None,
+            // Only OCM-generated cleanup diagnostics belong in history. The
+            // general summary may contain private OpenClaw command output.
+            note: transaction.cleanup_note.clone(),
         };
         save_upgrade_history_record(&record, &self.env, &self.cwd)
     }
@@ -4703,7 +4728,7 @@ impl Cli {
         binding_name: String,
         runtime_release_version: Option<String>,
         runtime_release_channel: Option<String>,
-        transaction: UpgradeTransaction,
+        mut transaction: UpgradeTransaction,
         error: String,
     ) -> Result<UpgradeEnvSummary, String> {
         if !transaction.rollback_enabled {
@@ -4748,9 +4773,12 @@ impl Cli {
         }
 
         let rollback_result = self.rollback_upgrade_locked(env_name, &transaction);
+        if let Ok(cleanup_note) = &rollback_result {
+            transaction.cleanup_note = cleanup_note.clone();
+        }
         let snapshot_id = transaction.snapshot_id.clone();
         let mut summary = match rollback_result {
-            Ok(()) => UpgradeEnvSummary {
+            Ok(cleanup_warning) => UpgradeEnvSummary {
                 env_name: env_name.to_string(),
                 previous_binding_kind: previous_binding_kind.to_string(),
                 previous_binding_name,
@@ -4762,9 +4790,12 @@ impl Cli {
                 service_action: None,
                 snapshot_id: Some(snapshot_id),
                 rollback: Some("restored".to_string()),
-                note: Some(format!(
-                    "upgrade failed, so ocm restored the pre-upgrade snapshot: {error}"
-                )),
+                note: join_optional_warnings(
+                    Some(format!(
+                        "upgrade failed, so ocm restored the pre-upgrade snapshot: {error}"
+                    )),
+                    cleanup_warning,
+                ),
             },
             Err(rollback_error) => UpgradeEnvSummary {
                 env_name: env_name.to_string(),
@@ -4797,7 +4828,7 @@ impl Cli {
         &self,
         env_name: &str,
         transaction: &UpgradeTransaction,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         let changes_runtime_trees = !transaction.mutated_runtime_names.is_empty();
         let changes_binding = transaction.source.kind != transaction.target.kind
             || transaction.source.name != transaction.target.name;
@@ -4815,32 +4846,47 @@ impl Cli {
         }) {
             self.restore_runtime_backup(runtime_backup)?;
         }
-        self.environment_service()
-            .restore_snapshot_locked(RestoreEnvSnapshotOptions {
+        let restore = self.environment_service().prepare_snapshot_restore_locked(
+            RestoreEnvSnapshotOptions {
                 env_name: env_name.to_string(),
                 snapshot_id: transaction.snapshot_id.clone(),
-            })?;
-        if changes_runtime_trees {
-            self.service_service().wait_for_binding_convergence_locked(
-                env_name,
-                &transaction.source.kind,
-                &transaction.source.name,
-            )?;
-        }
+            },
+        )?;
+        // Keep displaced state until the restored service has recovered. Slow or
+        // failed discard-only cleanup must not extend the outage.
+        let acceptance = (|| {
+            if changes_runtime_trees {
+                self.service_service().wait_for_binding_convergence_locked(
+                    env_name,
+                    &transaction.source.kind,
+                    &transaction.source.name,
+                )?;
+            }
+            if transaction.service_before.enabled && transaction.service_before.running {
+                let started = self
+                    .service_service()
+                    .start_locked(env_name)
+                    .map_err(|error| format!("failed to restart the restored service: {error}"))?;
+                self.wait_for_restarted_gateway_health(env_name, started.desired_running)?;
+            }
+            Ok::<(), String>(())
+        })();
+        acceptance.map_err(|error| format!("{error}; {}", restore.retained_operation_note()))?;
+        let mut restored = self
+            .environment_service()
+            .commit_snapshot_restore_locked(restore);
         for runtime_name in transaction
             .created_runtime_names
             .iter()
             .filter(|runtime_name| transaction.mutated_runtime_names.contains(*runtime_name))
         {
-            self.remove_runtime_created_during_upgrade(runtime_name)?;
+            if let Err(error) = self.remove_runtime_created_during_upgrade(runtime_name) {
+                restored.warnings.push(format!(
+                    "unused runtime {runtime_name} cleanup requires attention: {error}"
+                ));
+            }
         }
-        if transaction.service_before.enabled && transaction.service_before.running {
-            self.service_service()
-                .start_locked(env_name)
-                .map(|_| ())
-                .map_err(|error| format!("failed to restart the restored service: {error}"))?;
-        }
-        Ok(())
+        Ok((!restored.warnings.is_empty()).then(|| restored.warnings.join("; ")))
     }
 
     fn remove_runtime_created_during_upgrade(&self, runtime_name: &str) -> Result<(), String> {
@@ -5068,6 +5114,7 @@ impl UpgradeSimulationScenario {
 #[derive(Debug)]
 struct UpgradeTransaction {
     id: String,
+    cleanup_note: Option<String>,
     // Retain failed/displaced preparation trees through restart or rollback.
     _checkpoint_cleanup: crate::store::CheckpointCleanup,
     snapshot_id: String,

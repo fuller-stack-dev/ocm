@@ -58,6 +58,8 @@ pub struct EnvSnapshotRestoreSummary {
     pub default_runtime: Option<String>,
     pub default_launcher: Option<String>,
     pub protected: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -228,7 +230,7 @@ impl<'a> EnvironmentService<'a> {
     pub(crate) fn commit_snapshot_restore_locked(
         &self,
         transaction: EnvSnapshotRestoreTransaction,
-    ) -> Result<(), String> {
+    ) -> EnvSnapshotRestoreSummary {
         commit_env_snapshot_restore(transaction)
     }
 

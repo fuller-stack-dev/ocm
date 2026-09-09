@@ -2456,6 +2456,14 @@ pub fn env_snapshot_restored(
         rows.push(KeyValueRow::warning("Protected", "yes"));
     }
     push_card(&mut lines, "Environment", rows, profile.color);
+    if !restored.warnings.is_empty() {
+        let rows = restored
+            .warnings
+            .iter()
+            .map(|warning| KeyValueRow::warning("Warning", warning.clone()))
+            .collect::<Vec<_>>();
+        lines.extend(render_key_value_card("Warnings", &rows, profile.color));
+    }
     lines
 }
 
@@ -2481,6 +2489,12 @@ fn env_snapshot_restored_raw(restored: &EnvSnapshotRestoreSummary) -> Vec<String
     if restored.protected {
         lines.push("  protected: true".to_string());
     }
+    lines.extend(
+        restored
+            .warnings
+            .iter()
+            .map(|warning| format!("  warning: {warning}")),
+    );
     lines
 }
 

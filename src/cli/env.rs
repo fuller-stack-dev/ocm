@@ -947,9 +947,8 @@ impl Cli {
                             });
                         match service_acceptance {
                             Ok(()) => {
-                                self.environment_service()
-                                    .commit_snapshot_restore_locked(transaction)?;
-                                Ok(restored)
+                                Ok(self.environment_service()
+                                    .commit_snapshot_restore_locked(transaction))
                             }
                             Err(service_error) => {
                                 let rollback_result = self
